@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gpu-reml"
 version = "0.2.0"
-description = "GPU-accelerated REML estimation for large-scale genomic variance components"
+description = "Matrix-free GPU REML for genotype-defined variance components"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

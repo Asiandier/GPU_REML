@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-reml"
+version = "0.2.0"
+description = "GPU-accelerated REML estimation for large-scale genomic variance components"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "polars>=0.20",
+    "numba>=0.58",
+    "bed-reader>=0.3",
+]
+
+[project.optional-dependencies]
+pgen = ["pgenlib>=0.90"]
+dev = [
+    "pytest>=7.0",
+    "pgenlib>=0.90",
+]
+
+[project.scripts]
+gpu-reml = "GPU_REML.run_reml_pipeline:main"
+gpu-reml-sparse = "GPU_REML.run_sparse_reml_pipeline:main"
+gpu-reml-gwas = "GPU_REML.run_gwas_pipeline:main"
+
+[tool.setuptools]
+packages = ["GPU_REML"]
+package-dir = { "GPU_REML" = "." }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

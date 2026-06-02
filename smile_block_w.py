@@ -2,11 +2,13 @@
 SMILE-style block-weighted GRM operators.
 
 This module is intentionally separate from the production infinitesimal GRM
-path.  It implements kernels of the form
+path.  It implements one genetic kernel of the form
 
-    K_i V = Z_i W_i Z_i.T V / c_i
+    K V = sum_i Z_i W_i Z_i.T V / c
 
-for contiguous block-diagonal weight matrices W = diag(W_1, ..., W_G).
+for contiguous block-diagonal weight matrices W = diag(W_1, ..., W_G).  The
+blocks are a computational decomposition of one variance component, not
+separate variance components.
 The genotype standardisation and packed streaming cache are reused from
 ``GenoBlockStreamer``; only the block weight logic lives here.
 """
@@ -34,7 +36,7 @@ class SmileBlockWeight:
 
     matrix: np.ndarray
     start: int
-    normalizer: float
+    trace_per_sample: float
     source: str | None = None
 
     @property
@@ -259,7 +261,7 @@ class SmileBlockWeightedOperator:
                 raise ValueError(
                     f"W[{idx}] with size {W.shape[0]} exceeds streamer.m={int(streamer.m)}."
                 )
-            normalizer = self._compute_normalizer(
+            trace_per_sample = self._compute_trace_per_sample(
                 streamer,
                 W,
                 start=start,
@@ -269,7 +271,7 @@ class SmileBlockWeightedOperator:
                 SmileBlockWeight(
                     matrix=W,
                     start=start,
-                    normalizer=normalizer,
+                    trace_per_sample=trace_per_sample,
                     source=source,
                 )
             )
@@ -284,6 +286,10 @@ class SmileBlockWeightedOperator:
         self.streamer = streamer
         self.blocks = tuple(blocks)
         self.normalization = normalization
+        self.normalizer = self._compute_global_normalizer(
+            [block.trace_per_sample for block in blocks],
+            normalization=normalization,
+        )
         self.strict_coverage = bool(strict_coverage)
 
     @classmethod
@@ -297,7 +303,7 @@ class SmileBlockWeightedOperator:
         return cls(streamer, matrices, sources=[os.fspath(path) for path in paths], **kwargs)
 
     @staticmethod
-    def _compute_normalizer(
+    def _compute_trace_per_sample(
         streamer,
         W: np.ndarray,
         *,
@@ -305,7 +311,7 @@ class SmileBlockWeightedOperator:
         normalization: Normalization,
     ) -> float:
         if normalization == "none":
-            return 1.0
+            return 0.0
         if normalization == "weight_trace":
             value = float(np.trace(np.asarray(W, dtype=np.float64)))
         else:
@@ -313,7 +319,20 @@ class SmileBlockWeightedOperator:
             Z = np.asarray(streamer.extract_standardized_columns(idx), dtype=np.float64)
             value = float(np.sum((Z @ np.asarray(W, dtype=np.float64)) * Z) / float(streamer.n))
         if not np.isfinite(value) or value <= 0.0:
-            raise ValueError(f"Invalid SMILE block normalizer: {value!r}.")
+            raise ValueError(f"Invalid SMILE block trace contribution: {value!r}.")
+        return value
+
+    @staticmethod
+    def _compute_global_normalizer(
+        trace_values: Sequence[float],
+        *,
+        normalization: Normalization,
+    ) -> float:
+        if normalization == "none":
+            return 1.0
+        value = float(np.sum(np.asarray(trace_values, dtype=np.float64)))
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Invalid SMILE global normalizer: {value!r}.")
         return value
 
     @property
@@ -324,21 +343,11 @@ class SmileBlockWeightedOperator:
         self,
         V: jnp.ndarray,
         block_idx: int | None = None,
-        block_scales: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
-        if block_idx is not None and block_scales is not None:
-            raise ValueError("Provide either block_idx or block_scales, not both.")
-        if block_scales is not None and int(block_scales.shape[0]) != len(self.blocks):
-            raise ValueError(
-                f"block_scales length mismatch: expected {len(self.blocks)}, "
-                f"got {int(block_scales.shape[0])}."
-            )
         squeeze = V.ndim == 1
         if squeeze:
             V = V[:, None]
         V = jax.device_put(jnp.asarray(V), self.streamer.dev)
-        if block_scales is not None:
-            block_scales = jax.device_put(jnp.asarray(block_scales, dtype=V.dtype), self.streamer.dev)
         XtV = self.streamer.xtv(V, normalize=False)
         if XtV.ndim == 1:
             XtV = XtV[:, None]
@@ -351,9 +360,7 @@ class SmileBlockWeightedOperator:
                 continue
             W_dev = jax.device_put(jnp.asarray(block.matrix, dtype=fp), self.streamer.dev)
             local = W_dev @ XtV[block.start : block.stop, :]
-            local = local / jnp.asarray(block.normalizer, dtype=fp)
-            if block_scales is not None:
-                local = local * block_scales[idx].astype(fp)
+            local = local / jnp.asarray(self.normalizer, dtype=fp)
             scores = scores.at[block.start : block.stop, :].set(local)
         return scores
 
@@ -372,7 +379,7 @@ class SmileBlockWeightedOperator:
         return b_by_call
 
     def kv(self, V: jnp.ndarray) -> jnp.ndarray:
-        """Return ``sum_i Z_i W_i Z_i.T V / c_i``."""
+        """Return ``sum_i Z_i W_i Z_i.T V / c`` for one genetic kernel."""
 
         squeeze = V.ndim == 1
         scores = self._weighted_scores(V)
@@ -384,7 +391,7 @@ class SmileBlockWeightedOperator:
         return out[:, 0] if squeeze else out
 
     def block_kv(self, V: jnp.ndarray, block_idx: int) -> jnp.ndarray:
-        """Return one block contribution ``Z_i W_i Z_i.T V / c_i``."""
+        """Return one computational block contribution ``Z_i W_i Z_i.T V / c``."""
 
         if block_idx < 0 or block_idx >= len(self.blocks):
             raise IndexError(f"block_idx={block_idx} out of range for {len(self.blocks)} blocks.")
@@ -398,7 +405,7 @@ class SmileBlockWeightedOperator:
         return out[:, 0] if squeeze else out
 
     def stacked_block_kv(self, V: jnp.ndarray) -> jnp.ndarray:
-        """Return one ``K_i V`` per W block, stacked on axis 0."""
+        """Return normalized computational block contributions stacked on axis 0."""
 
         return jnp.stack([self.block_kv(V, idx) for idx in range(len(self.blocks))], axis=0)
 
@@ -408,24 +415,28 @@ class SmileBlockWeightedOperator:
         theta_e: jnp.ndarray | None,
         V: jnp.ndarray,
     ) -> jnp.ndarray:
-        """Return ``theta_e V + sum_i theta_g[i] K_i V``."""
+        """Return ``theta_e V + theta_g K V`` with one genetic variance component."""
 
-        if int(theta_g.shape[0]) != len(self.blocks):
-            raise ValueError(
-                f"theta_g length mismatch: expected {len(self.blocks)}, got {int(theta_g.shape[0])}."
-            )
+        theta_g_arr = jnp.asarray(theta_g)
+        if theta_g_arr.ndim == 0:
+            theta_g_scalar = theta_g_arr
+        elif theta_g_arr.ndim == 1 and int(theta_g_arr.shape[0]) == 1:
+            theta_g_scalar = theta_g_arr[0]
+        else:
+            raise ValueError("theta_g must be a scalar or a length-one array for SMILE block-W.")
         squeeze = V.ndim == 1
         if squeeze:
             V_work = V[:, None]
         else:
             V_work = V
         V_dev = jax.device_put(jnp.asarray(V_work), self.streamer.dev)
-        scores = self._weighted_scores(V_dev, block_scales=theta_g)
+        scores = self._weighted_scores(V_dev)
         out = _zxm_impl_streamed(
             self.streamer,
             self._scores_by_call(scores),
             missing_val=int(self.streamer._missing_val),
         )
+        out = jnp.asarray(theta_g_scalar, dtype=V_dev.dtype) * out
         if theta_e is not None:
             out = out + jnp.asarray(theta_e, dtype=V_dev.dtype) * V_dev
         return out[:, 0] if squeeze else out

@@ -44,7 +44,7 @@ def _make_non_degenerate_genotypes(n: int, m: int, seed: int) -> np.ndarray:
     raise RuntimeError("failed to build non-degenerate genotype matrix")
 
 
-def test_identity_block_weights_match_existing_component_kv():
+def test_identity_block_weights_match_existing_global_kv():
     X = _make_non_degenerate_genotypes(n=24, m=10, seed=201)
     block_sizes = [4, 6]
     V = jnp.asarray(
@@ -63,10 +63,15 @@ def test_identity_block_weights_match_existing_component_kv():
             normalization="kernel_trace",
             check_psd=True,
         )
-        got = np.asarray(op.stacked_block_kv(V))
-        ref = np.asarray(st.stacked_component_kv(V))
-        assert got.shape == ref.shape
+        got = np.asarray(op.kv(V))
+        ref = np.asarray(st.kv(V))
         assert np.allclose(got, ref, atol=2e-3, rtol=3e-4)
+        assert np.allclose(
+            np.asarray(jnp.sum(op.stacked_block_kv(V), axis=0)),
+            got,
+            atol=2e-3,
+            rtol=3e-4,
+        )
     finally:
         st.close()
 
@@ -96,20 +101,55 @@ def test_weighted_blocks_match_explicit_matrix_reference():
         got = np.asarray(op.kv(jnp.asarray(V)))
 
         ref = jnp.zeros_like(jnp.asarray(V))
+        raw_trace_per_sample = 0.0
         for block in op.blocks:
             start = block.start
             W = jnp.asarray(block.matrix, dtype=jnp.float32)
             idx = np.arange(start, start + W.shape[0], dtype=np.int64)
             Z = jnp.asarray(st.extract_standardized_columns(idx), dtype=jnp.float32)
-            ref = ref + (Z @ (W @ (Z.T @ jnp.asarray(V)))) / jnp.asarray(
-                block.normalizer, dtype=jnp.float32
-            )
+            ref = ref + Z @ (W @ (Z.T @ jnp.asarray(V)))
+            raw_trace_per_sample += float(np.sum((np.asarray(Z) @ np.asarray(W)) * np.asarray(Z)) / X.shape[0])
+        ref = ref / jnp.asarray(op.normalizer, dtype=jnp.float32)
+        assert op.normalizer == pytest.approx(raw_trace_per_sample, rel=1e-6)
         assert np.allclose(got, np.asarray(ref), atol=3e-3, rtol=5e-4)
     finally:
         st.close()
 
 
-def test_weighted_hv_matches_manual_block_sum():
+def test_global_trace_normalization_sets_average_diagonal_to_one():
+    X = _make_non_degenerate_genotypes(n=18, m=7, seed=208)
+    rng = np.random.RandomState(209)
+    A0 = rng.standard_normal((3, 3))
+    A1 = rng.standard_normal((4, 4))
+    W0 = A0 @ A0.T + 0.1 * np.eye(3)
+    W1 = A1 @ A1.T + 0.1 * np.eye(4)
+
+    st = GenoBlockStreamer(
+        _ArraySource(X),
+        call_width=3,
+        component_block_sizes=[3, 4],
+        keep_host_stats=True,
+    )
+    try:
+        op = SmileBlockWeightedOperator(
+            st,
+            [W0, W1],
+            normalization="kernel_trace",
+            check_psd=True,
+        )
+        K = np.zeros((X.shape[0], X.shape[0]), dtype=np.float64)
+        for block in op.blocks:
+            idx = np.arange(block.start, block.stop, dtype=np.int64)
+            Z = np.asarray(st.extract_standardized_columns(idx), dtype=np.float64)
+            W = np.asarray(block.matrix, dtype=np.float64)
+            K += Z @ W @ Z.T
+        K /= op.normalizer
+        assert np.trace(K) == pytest.approx(float(X.shape[0]), rel=2e-6, abs=2e-6)
+    finally:
+        st.close()
+
+
+def test_weighted_hv_uses_single_genetic_variance_component():
     X = _make_non_degenerate_genotypes(n=20, m=7, seed=205)
     V = jnp.asarray(
         np.random.RandomState(206).standard_normal((X.shape[0], 2)).astype(np.float32)
@@ -127,13 +167,13 @@ def test_weighted_hv_matches_manual_block_sum():
             normalization="kernel_trace",
             check_psd=True,
         )
-        theta_g = jnp.asarray([0.25, 0.4], dtype=jnp.float32)
+        theta_g = jnp.asarray(0.25, dtype=jnp.float32)
         theta_e = jnp.asarray(0.35, dtype=jnp.float32)
         got = np.asarray(op.weighted_hv(theta_g, theta_e, V))
-        ref = theta_e * np.asarray(V)
-        ref = ref + 0.25 * np.asarray(op.block_kv(V, 0))
-        ref = ref + 0.4 * np.asarray(op.block_kv(V, 1))
+        ref = theta_e * np.asarray(V) + 0.25 * np.asarray(op.kv(V))
         assert np.allclose(got, ref, atol=2e-3, rtol=3e-4)
+        with pytest.raises(ValueError, match="scalar or a length-one array"):
+            op.weighted_hv(jnp.asarray([0.25, 0.4], dtype=jnp.float32), theta_e, V)
     finally:
         st.close()
 

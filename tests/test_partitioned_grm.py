@@ -29,6 +29,36 @@ build_projected_core_atoms_multi_streamed = KV_IMPL.build_projected_core_atoms_m
 BedGenoSource = GENO_SOURCE.BedGenoSource
 
 
+def test_evict_ring_worker_count_does_not_exceed_depth(monkeypatch):
+    monkeypatch.setattr(GENO_STREAM, "_pin_buffer", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(GENO_STREAM, "_unpin_buffer", lambda *_args, **_kwargs: None)
+    n_calls = 5
+    n = 3
+    packed_width = 2
+    block_bytes = n * packed_width
+    packed = np.arange(n_calls * block_bytes, dtype=np.uint8)
+    offsets = np.arange(n_calls + 1, dtype=np.int64) * block_bytes
+    ring = GENO_STREAM._EvictRing(
+        None,
+        packed,
+        offsets,
+        n_calls=n_calls,
+        n=n,
+        max_packed_width=packed_width,
+        depth=2,
+        dev=None,
+    )
+    try:
+        ring.start_pass(prefill=1)
+        assert len(ring._threads) == 2
+        for c in range(n_calls):
+            got = np.asarray(ring.get(c), dtype=np.uint8)
+            expected = packed[offsets[c] : offsets[c + 1]]
+            assert np.array_equal(got, expected)
+    finally:
+        ring.close()
+
+
 class _ArraySource:
     def __init__(self, block: np.ndarray, missing_val: int = -9):
         self._block = np.asarray(block, dtype=np.int8)

@@ -181,7 +181,7 @@ class _EvictRing:
         for ev in self._writable:
             ev.set()
         self._threads = []
-        n_workers = min(4, self._n_calls)
+        n_workers = min(4, self._n_calls, self.DEPTH)
         for tid in range(n_workers):
             th = threading.Thread(target=self._worker, args=(tid, n_workers), daemon=True)
             th.start()

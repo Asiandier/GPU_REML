@@ -175,6 +175,82 @@ def test_arbitrary_grouped_streamer_build_reads_source_in_source_order_chunks():
         st.close()
 
 
+def test_partial_arbitrary_grouped_streamer_matches_subset_reference():
+    X = _make_non_degenerate_genotypes(n=18, m=14, seed=1041)
+    component_variant_indices = [
+        [0, 5, 9],
+        [2, 6, 13],
+    ]
+    selected = np.concatenate(
+        [np.asarray(group, dtype=np.int64) for group in component_variant_indices]
+    )
+    local_groups = [
+        np.arange(0, 3, dtype=np.int64),
+        np.arange(3, 6, dtype=np.int64),
+    ]
+    V = jnp.asarray(
+        np.random.RandomState(1042).standard_normal((X.shape[0], 3)).astype(np.float32)
+    )
+
+    part = GenoBlockStreamer(
+        _ArraySource(X),
+        call_width=3,
+        component_variant_indices=component_variant_indices,
+        keep_host_stats=True,
+    )
+    ref = GenoBlockStreamer(
+        _ArraySource(X[:, selected]),
+        call_width=3,
+        component_variant_indices=local_groups,
+        keep_host_stats=True,
+    )
+    try:
+        assert part.m == selected.size
+        assert part.source_m == X.shape[1]
+        assert np.array_equal(
+            np.asarray(part._cache_to_source_variant_indices, dtype=np.int64),
+            selected,
+        )
+        assert np.allclose(
+            np.asarray(part._means_host, dtype=np.float32),
+            np.asarray(ref._means_host, dtype=np.float32),
+            atol=1e-6,
+        )
+        assert np.allclose(
+            np.asarray(part._inv_sds_host, dtype=np.float32),
+            np.asarray(ref._inv_sds_host, dtype=np.float32),
+            atol=1e-6,
+        )
+        assert np.allclose(
+            np.asarray(part.stacked_component_kv(V)),
+            np.asarray(ref.stacked_component_kv(V)),
+            atol=1e-5,
+        )
+    finally:
+        part.close()
+        ref.close()
+
+
+def test_partial_arbitrary_grouped_streamer_skips_unselected_source_gaps():
+    X = _make_non_degenerate_genotypes(n=10, m=20, seed=1046)
+    src = _CountingVariantMajorSource(X)
+    st = GenoBlockStreamer(
+        src,
+        call_width=4,
+        component_variant_indices=[
+            [0],
+            [9],
+            [19],
+        ],
+        keep_host_stats=True,
+        source_build_chunk_width=4,
+    )
+    try:
+        assert src.read_calls == [(0, 4), (9, 4), (19, 1)]
+    finally:
+        st.close()
+
+
 def test_arbitrary_grouped_streamer_honors_source_build_chunk_width_override():
     X = _make_non_degenerate_genotypes(n=10, m=12, seed=1043)
     src = _CountingVariantMajorSource(X)
@@ -262,6 +338,73 @@ def test_arbitrary_grouped_bed_streamer_uses_raw_source_order_build(tmp_path, mo
         got = np.asarray(bed_st.stacked_component_kv(V))
         ref = np.asarray(ref_st.stacked_component_kv(V))
         assert np.allclose(got, ref, atol=1e-5)
+    finally:
+        bed_st.close()
+        ref_st.close()
+
+
+def test_partial_arbitrary_grouped_bed_streamer_matches_subset_reference(tmp_path):
+    bed_reader = pytest.importorskip("bed_reader")
+
+    X = _make_non_degenerate_genotypes(n=12, m=16, seed=1044)
+    sample_mask = np.array(
+        [True, True, False, True, False, True, True, False, True, True, False, True]
+    )
+    component_variant_indices = [
+        [0, 5, 8],
+        [2, 11, 15],
+    ]
+    selected = np.concatenate(
+        [np.asarray(group, dtype=np.int64) for group in component_variant_indices]
+    )
+    local_groups = [
+        np.arange(0, 3, dtype=np.int64),
+        np.arange(3, 6, dtype=np.int64),
+    ]
+    V = jnp.asarray(
+        np.random.RandomState(1045)
+        .standard_normal((int(sample_mask.sum()), 2))
+        .astype(np.float32)
+    )
+
+    prefix = tmp_path / "toy_partial"
+    bed_reader.to_bed(str(prefix) + ".bed", X.astype(np.float32))
+
+    ref_st = GenoBlockStreamer(
+        _ArraySource(X[sample_mask, :][:, selected]),
+        call_width=3,
+        component_variant_indices=local_groups,
+        keep_host_stats=True,
+    )
+    bed_st = BedBlockStreamer(
+        str(prefix),
+        call_width=3,
+        component_variant_indices=component_variant_indices,
+        sample_mask=sample_mask,
+        keep_host_stats=True,
+    )
+    try:
+        assert bed_st.m == selected.size
+        assert bed_st.source_m == X.shape[1]
+        assert np.array_equal(
+            np.asarray(bed_st._cache_to_source_variant_indices, dtype=np.int64),
+            selected,
+        )
+        assert np.allclose(
+            np.asarray(bed_st._means_host, dtype=np.float32),
+            np.asarray(ref_st._means_host, dtype=np.float32),
+            atol=1e-6,
+        )
+        assert np.allclose(
+            np.asarray(bed_st._inv_sds_host, dtype=np.float32),
+            np.asarray(ref_st._inv_sds_host, dtype=np.float32),
+            atol=1e-6,
+        )
+        assert np.allclose(
+            np.asarray(bed_st.stacked_component_kv(V)),
+            np.asarray(ref_st.stacked_component_kv(V)),
+            atol=1e-5,
+        )
     finally:
         bed_st.close()
         ref_st.close()

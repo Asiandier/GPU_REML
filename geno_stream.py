@@ -357,14 +357,16 @@ def _normalize_component_variant_indices(
         cache_to_source = np.concatenate(normalized, axis=0)
     else:
         cache_to_source = np.empty((0,), dtype=np.int64)
-    if cache_to_source.size != int(m):
+    if cache_to_source.size == 0:
+        raise ValueError("component_variant_indices must cover at least one SNP.")
+    if cache_to_source.size > int(m):
         raise ValueError(
-            f"component_variant_indices must define a full partition of m={int(m)} SNPs; "
-            f"got {cache_to_source.size} assignments."
+            f"component_variant_indices assign {cache_to_source.size} SNPs, "
+            f"which exceeds source m={int(m)}."
         )
-    if np.unique(cache_to_source).size != int(m):
+    if np.unique(cache_to_source).size != cache_to_source.size:
         raise ValueError("component_variant_indices must be disjoint across components.")
-    if int(m) > 0:
+    if cache_to_source.size == int(m):
         src_sorted = np.sort(cache_to_source)
         if not np.array_equal(src_sorted, np.arange(int(m), dtype=np.int64)):
             raise ValueError("component_variant_indices must cover every SNP exactly once.")
@@ -495,23 +497,34 @@ def _build_source_scatter_plan(
     packed_call_widths: np.ndarray,
     packed_offsets: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    source_to_cache = np.empty((int(m),), dtype=np.int64)
-    source_to_cache[np.asarray(cache_to_source_variant_indices, dtype=np.int64)] = np.arange(
-        int(m), dtype=np.int64
-    )
-    source_call_idx = np.searchsorted(
-        np.asarray(call_snp_starts, dtype=np.int64),
-        source_to_cache,
-        side="right",
-    ) - 1
-    source_call_idx = np.clip(source_call_idx, 0, len(call_snp_starts) - 1).astype(np.int32)
-    source_local_col = (
-        source_to_cache - np.asarray(call_snp_starts, dtype=np.int64)[source_call_idx]
-    ).astype(np.int32)
-    source_byte_idx = (source_local_col >> 2).astype(np.int32)
-    source_bit_shift = ((source_local_col & 3) << 1).astype(np.uint8)
-    source_call_offsets = np.asarray(packed_offsets[:-1], dtype=np.int64)[source_call_idx]
-    source_packed_widths = np.asarray(packed_call_widths, dtype=np.int32)[source_call_idx]
+    cache_to_source = np.asarray(cache_to_source_variant_indices, dtype=np.int64)
+    source_to_cache = np.full((int(m),), -1, dtype=np.int64)
+    source_to_cache[cache_to_source] = np.arange(cache_to_source.size, dtype=np.int64)
+    valid = source_to_cache >= 0
+
+    source_call_idx = np.zeros((int(m),), dtype=np.int32)
+    source_local_col = np.zeros((int(m),), dtype=np.int32)
+    source_byte_idx = np.zeros((int(m),), dtype=np.int32)
+    source_bit_shift = np.zeros((int(m),), dtype=np.uint8)
+    source_call_offsets = np.zeros((int(m),), dtype=np.int64)
+    source_packed_widths = np.zeros((int(m),), dtype=np.int32)
+    if np.any(valid):
+        call_idx_valid = np.searchsorted(
+            np.asarray(call_snp_starts, dtype=np.int64),
+            source_to_cache[valid],
+            side="right",
+        ) - 1
+        call_idx_valid = np.clip(call_idx_valid, 0, len(call_snp_starts) - 1).astype(np.int32)
+        local_col_valid = (
+            source_to_cache[valid]
+            - np.asarray(call_snp_starts, dtype=np.int64)[call_idx_valid]
+        ).astype(np.int32)
+        source_call_idx[valid] = call_idx_valid
+        source_local_col[valid] = local_col_valid
+        source_byte_idx[valid] = (local_col_valid >> 2).astype(np.int32)
+        source_bit_shift[valid] = ((local_col_valid & 3) << 1).astype(np.uint8)
+        source_call_offsets[valid] = np.asarray(packed_offsets[:-1], dtype=np.int64)[call_idx_valid]
+        source_packed_widths[valid] = np.asarray(packed_call_widths, dtype=np.int32)[call_idx_valid]
     return (
         source_to_cache,
         source_call_offsets,
@@ -519,6 +532,34 @@ def _build_source_scatter_plan(
         source_byte_idx,
         source_bit_shift,
     )
+
+
+def _iter_source_order_build_spans(
+    source_m: int,
+    cache_to_source_variant_indices: np.ndarray,
+    chunk_width: int,
+):
+    """Yield source-order spans that contain only SNPs covered by the GRM cache."""
+    cache_to_source = np.asarray(cache_to_source_variant_indices, dtype=np.int64)
+    if cache_to_source.size == int(source_m) and np.array_equal(
+        cache_to_source,
+        np.arange(int(source_m), dtype=np.int64),
+    ):
+        for source_start in range(0, int(source_m), max(1, int(chunk_width))):
+            width = min(max(1, int(chunk_width)), int(source_m) - int(source_start))
+            yield int(source_start), int(width)
+        return
+
+    selected = np.sort(cache_to_source)
+    if selected.size == 0:
+        return
+    width = max(1, int(chunk_width))
+    pos = 0
+    while pos < selected.size:
+        source_start = int(selected[pos])
+        source_stop = min(int(source_m), source_start + width)
+        yield source_start, source_stop - source_start
+        pos = int(np.searchsorted(selected, source_stop, side="left"))
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -765,6 +806,8 @@ def _scatter_pack_raw_bed_to_cache_numba(
         s_boff = np.int64(sample_byte_offsets[i])
         s_bshift = np.uint8(sample_bit_shifts[i])
         for j in range(snp_count):
+            if packed_widths[j] <= 0:
+                continue
             row_base = hdr + np.int64(snp_start + j) * np.int64(bytes_per_snp)
             g = (bed_raw[row_base + s_boff] >> s_bshift) & np.uint8(3)
             out_idx = (
@@ -923,6 +966,8 @@ def _scatter_pack_varmaj_to_cache_numba(
     n_samples = block_vm.shape[1]
     for i in prange(n_samples):
         for j in range(n_snps):
+            if packed_widths[j] <= 0:
+                continue
             out_idx = (
                 np.int64(call_offsets[j])
                 + np.int64(i) * np.int64(packed_widths[j])
@@ -1071,8 +1116,9 @@ class GenoBlockStreamer:
 
         self.bed_prefix = bed_prefix  # kept for debug messages / compat
         source_n = source.n
+        self.source_m = int(source.m)
         self.n = int(np.sum(self._sample_mask)) if self._sample_mask is not None else source_n
-        self.m = source.m
+        self.m = int(source.m)
 
         self._bed_int_missing = source.missing_val
         self._build_threads = max(1, int(build_threads or (os.cpu_count() or 1)))
@@ -1102,11 +1148,13 @@ class GenoBlockStreamer:
             component_block_sizes is not None or component_variant_indices is not None
         )
         self._component_partition_plan = _build_component_partition_plan(
-            self.m,
+            self.source_m,
             component_block_sizes=component_block_sizes,
             component_variant_indices=component_variant_indices,
         )
         self._component_block_sizes = self._component_partition_plan.component_sizes
+        if self._has_component_partition:
+            self.m = int(sum(self._component_block_sizes))
         self._cache_to_source_variant_indices = (
             np.asarray(
                 self._component_partition_plan.cache_to_source_variant_indices,
@@ -1166,7 +1214,7 @@ class GenoBlockStreamer:
                 self._source_packed_byte_indices,
                 self._source_packed_bit_shifts,
             ) = _build_source_scatter_plan(
-                self.m,
+                self.source_m,
                 self._cache_to_source_variant_indices,
                 self._call_snp_starts,
                 self._call_true_widths,
@@ -1286,10 +1334,10 @@ class GenoBlockStreamer:
 
     def _source_build_chunk_width(self) -> int:
         if self._source_build_chunk_width_cfg is not None:
-            return max(1, min(int(self.m), int(self._source_build_chunk_width_cfg)))
+            return max(1, min(int(self.source_m), int(self._source_build_chunk_width_cfg)))
         target_bytes = 256 * 2**20
         width = max(1, target_bytes // max(1, int(self.n)))
-        return max(1, min(int(self.call_width), int(self.m), int(width)))
+        return max(1, min(int(self.call_width), int(self.source_m), int(width)))
 
     def _store_call_stats(
         self,
@@ -1406,7 +1454,8 @@ class GenoBlockStreamer:
         pack_buf = None
         try:
             bed_size = os.fstat(bed_fd).st_size
-            expected = 3 + self.m * bytes_per_snp
+            source_m = int(getattr(self, "source_m", self.m))
+            expected = 3 + source_m * bytes_per_snp
             if bed_size < expected:
                 raise ValueError(f"BED file too small: {bed_size} < {expected}")
             bed_mmap = mmap.mmap(bed_fd, 0, access=mmap.ACCESS_READ)
@@ -1613,7 +1662,8 @@ class GenoBlockStreamer:
         packed_write = None
         try:
             bed_size = os.fstat(bed_fd).st_size
-            expected = 3 + self.m * bytes_per_snp
+            source_m = int(getattr(self, "source_m", self.m))
+            expected = 3 + source_m * bytes_per_snp
             if bed_size < expected:
                 raise ValueError(f"BED file too small: {bed_size} < {expected}")
             bed_mmap = mmap.mmap(bed_fd, 0, access=mmap.ACCESS_READ)
@@ -1649,24 +1699,34 @@ class GenoBlockStreamer:
                 self._init_build_stat_buffers()
             )
             chunk_width = self._source_build_chunk_width()
-            n_chunks = max(1, (int(self.m) + chunk_width - 1) // chunk_width)
+            spans = list(
+                _iter_source_order_build_spans(
+                    self.source_m,
+                    self._cache_to_source_variant_indices,
+                    chunk_width,
+                )
+            )
+            n_chunks = max(1, len(spans))
 
             t0_wall = time.perf_counter()
             t_last = t0_wall
             snps_done = 0
 
             with _numba_thread_mask(self._build_threads):
-                for chunk_idx, source_start in enumerate(range(0, int(self.m), chunk_width)):
-                    tw = min(chunk_width, int(self.m) - int(source_start))
+                for chunk_idx, (source_start, tw) in enumerate(spans):
                     src_slice = slice(int(source_start), int(source_start) + int(tw))
                     cache_idx = np.asarray(
                         self._source_to_cache_variant_indices[src_slice],
                         dtype=np.int64,
                     )
+                    selected_mask = cache_idx >= 0
+                    cache_idx_selected = cache_idx[selected_mask]
+                    if cache_idx_selected.size == 0:
+                        continue
 
                     if use_precomputed_stats:
-                        mean = np.asarray(means_flat[cache_idx], dtype=np.float32)
-                        inv_sd = np.asarray(inv_sds_flat[cache_idx], dtype=np.float32)
+                        mean = np.asarray(means_flat[cache_idx_selected], dtype=np.float32)
+                        inv_sd = np.asarray(inv_sds_flat[cache_idx_selected], dtype=np.float32)
                     else:
                         cnt = np.zeros(tw, dtype=np.int64)
                         s1 = np.zeros(tw, dtype=np.int64)
@@ -1692,11 +1752,14 @@ class GenoBlockStreamer:
                         inv_sd = np.where(
                             valid, 1.0 / np.sqrt(np.maximum(var, 1e-6)), 0.0,
                         ).astype(np.float32)
-                        means_flat[cache_idx] = mean
-                        inv_sds_flat[cache_idx] = inv_sd
+                        means_flat[cache_idx_selected] = mean[selected_mask]
+                        inv_sds_flat[cache_idx_selected] = inv_sd[selected_mask]
                         if counts_flat is not None:
-                            counts_flat[cache_idx] = cnt.astype(np.int32, copy=False)
-                        eff += float(np.count_nonzero(inv_sd > 0.0))
+                            counts_flat[cache_idx_selected] = cnt[selected_mask].astype(
+                                np.int32,
+                                copy=False,
+                            )
+                        eff += float(np.count_nonzero(inv_sd[selected_mask] > 0.0))
 
                     _scatter_pack_raw_bed_to_cache_numba(
                         bed_raw,
@@ -1726,9 +1789,9 @@ class GenoBlockStreamer:
                             "  build-src [%d/%d] %.0f%% (%d/%d SNPs) %.0f M geno/s  elapsed=%.1fs",
                             chunk_idx + 1,
                             n_chunks,
-                            100.0 * snps_done / max(self.m, 1),
+                            100.0 * snps_done / max(self.source_m, 1),
                             snps_done,
-                            self.m,
+                            self.source_m,
                             rate,
                             elapsed,
                         )
@@ -1937,25 +2000,35 @@ class GenoBlockStreamer:
             )
             miss_val = int(self._bed_int_missing)
             chunk_width = self._source_build_chunk_width()
-            n_chunks = max(1, (int(self.m) + chunk_width - 1) // chunk_width)
+            spans = list(
+                _iter_source_order_build_spans(
+                    self.source_m,
+                    self._cache_to_source_variant_indices,
+                    chunk_width,
+                )
+            )
+            n_chunks = max(1, len(spans))
 
             t0_wall = time.perf_counter()
             t_last = t0_wall
             snps_done = 0
 
             with _numba_thread_mask(self._build_threads):
-                for chunk_idx, source_start in enumerate(range(0, int(self.m), chunk_width)):
-                    tw = min(chunk_width, int(self.m) - int(source_start))
+                for chunk_idx, (source_start, tw) in enumerate(spans):
                     block_vm = self._read_variant_major_source_span(int(source_start), int(tw))
                     src_slice = slice(int(source_start), int(source_start) + int(tw))
                     cache_idx = np.asarray(
                         self._source_to_cache_variant_indices[src_slice],
                         dtype=np.int64,
                     )
+                    selected_mask = cache_idx >= 0
+                    cache_idx_selected = cache_idx[selected_mask]
+                    if cache_idx_selected.size == 0:
+                        continue
 
                     if use_precomputed_stats:
-                        mean = np.asarray(means_flat[cache_idx], dtype=np.float32)
-                        inv_sd = np.asarray(inv_sds_flat[cache_idx], dtype=np.float32)
+                        mean = np.asarray(means_flat[cache_idx_selected], dtype=np.float32)
+                        inv_sd = np.asarray(inv_sds_flat[cache_idx_selected], dtype=np.float32)
                     else:
                         cnt, s1_arr, s2_arr = _stats_from_varmaj_numba(
                             block_vm[:tw, :], miss_val,
@@ -1970,11 +2043,14 @@ class GenoBlockStreamer:
                         inv_sd = np.where(
                             valid, 1.0 / np.sqrt(np.maximum(var, 1e-6)), 0.0,
                         ).astype(np.float32)
-                        means_flat[cache_idx] = mean
-                        inv_sds_flat[cache_idx] = inv_sd
+                        means_flat[cache_idx_selected] = mean[selected_mask]
+                        inv_sds_flat[cache_idx_selected] = inv_sd[selected_mask]
                         if counts_flat is not None:
-                            counts_flat[cache_idx] = cnt.astype(np.int32, copy=False)
-                        eff += float(np.count_nonzero(inv_sd > 0.0))
+                            counts_flat[cache_idx_selected] = cnt[selected_mask].astype(
+                                np.int32,
+                                copy=False,
+                            )
+                        eff += float(np.count_nonzero(inv_sd[selected_mask] > 0.0))
 
                     _scatter_pack_varmaj_to_cache_numba(
                         np.asarray(block_vm[:tw, :], dtype=np.int8),
@@ -1995,9 +2071,9 @@ class GenoBlockStreamer:
                             "  build-src [%d/%d] %.0f%% (%d/%d SNPs) %.0f M geno/s  elapsed=%.1fs",
                             chunk_idx + 1,
                             n_chunks,
-                            100.0 * snps_done / max(self.m, 1),
+                            100.0 * snps_done / max(self.source_m, 1),
                             snps_done,
-                            self.m,
+                            self.source_m,
                             rate,
                             elapsed,
                         )

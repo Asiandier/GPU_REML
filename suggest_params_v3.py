@@ -82,6 +82,8 @@ def _align_down_256(width: float) -> int:
 def _normalize_segments(
     p_list: Sequence[int],
     component_block_sizes: Optional[Sequence[int]],
+    *,
+    allow_partial_component_blocks: bool = False,
 ) -> tuple[int, ...]:
     if component_block_sizes is not None:
         segs = tuple(int(x) for x in component_block_sizes)
@@ -90,9 +92,12 @@ def _normalize_segments(
         if any(x <= 0 for x in segs):
             raise ValueError("component_block_sizes must be strictly positive.")
         total = sum(segs)
-        if p_list and total != sum(int(p) for p in p_list):
+        source_total = sum(int(p) for p in p_list)
+        if p_list and total != source_total:
+            if allow_partial_component_blocks and total < source_total:
+                return segs
             raise ValueError(
-                f"component_block_sizes must sum to total m={sum(int(p) for p in p_list)}; got {total}."
+                f"component_block_sizes must sum to total m={source_total}; got {total}."
             )
         return segs
     return tuple(int(p) for p in p_list)
@@ -396,7 +401,11 @@ def suggest_call_width(
     Reports estimated host anon memory for informational purposes.
     Never rejects based on host memory.
     """
-    segment_sizes = _normalize_segments(p_list, component_block_sizes)
+    segment_sizes = _normalize_segments(
+        p_list,
+        component_block_sizes,
+        allow_partial_component_blocks=bool(arbitrary_component_partition),
+    )
     G_geom = len(segment_sizes)
     G = int(n_grm) if n_grm is not None else G_geom
     if precond_type != "projected_core":

@@ -137,14 +137,15 @@ def test_global_trace_normalization_sets_average_diagonal_to_one():
             normalization="kernel_trace",
             check_psd=True,
         )
-        K = np.zeros((X.shape[0], X.shape[0]), dtype=np.float64)
+        trace_value = 0.0
         for block in op.blocks:
             idx = np.arange(block.start, block.stop, dtype=np.int64)
             Z = np.asarray(st.extract_standardized_columns(idx), dtype=np.float64)
             W = np.asarray(block.matrix, dtype=np.float64)
-            K += Z @ W @ Z.T
-        K /= op.normalizer
-        assert np.trace(K) == pytest.approx(float(X.shape[0]), rel=2e-6, abs=2e-6)
+            trace_value += float(np.sum((Z @ W) * Z))
+        assert trace_value / op.normalizer == pytest.approx(
+            float(X.shape[0]), rel=2e-6, abs=2e-6
+        )
     finally:
         st.close()
 

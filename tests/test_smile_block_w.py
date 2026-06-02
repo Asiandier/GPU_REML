@@ -273,6 +273,34 @@ def test_fitter_assembles_smile_single_kernel_reml_operator(monkeypatch):
         fitter.close()
 
 
+def test_fitter_runs_smile_end_to_end_variance_estimation():
+    X = _make_non_degenerate_genotypes(n=14, m=6, seed=214)
+    y = jnp.asarray(
+        np.random.RandomState(215).standard_normal((X.shape[0],)).astype(np.float32)
+    )
+    cfg = FitConfig(
+        sources=[_ArraySource(X)],
+        smile_weight_matrices=[np.eye(2), np.eye(4)],
+        call_width=3,
+        precond_rank=0,
+        n_rand_vec=2,
+        slq_samples=2,
+        slq_m=2,
+        minq_iter=2,
+        max_pcg_iters=30,
+        verbose=False,
+    )
+    fitter = InfinitesimalREMLFitter(cfg)
+    try:
+        res = fitter.fit_infinitesimal(y, h2_init=0.4)
+        vc = np.asarray(res.var_components)
+        assert vc.shape == (2,)
+        assert np.all(np.isfinite(vc))
+        assert np.all(vc >= 0.0)
+    finally:
+        fitter.close()
+
+
 def test_rejects_non_psd_weight_matrix():
     X = _make_non_degenerate_genotypes(n=12, m=2, seed=207)
     st = GenoBlockStreamer(_ArraySource(X), call_width=2, keep_host_stats=True)

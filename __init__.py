@@ -38,6 +38,11 @@ _EXPORTS: dict[str, str] = {
     "fit_weighted_lasso_with_covariates": ".lasso_cd",
     "GWASSummary": ".gwas",
     "run_continuous_gwas": ".gwas",
+    "SmileBlockWeight": ".smile_block_w",
+    "SmileBlockWeightedOperator": ".smile_block_w",
+    "load_rds_matrix": ".smile_block_w",
+    "load_weight_matrix": ".smile_block_w",
+    "validate_weight_matrix": ".smile_block_w",
 }
 
 __all__ = list(_EXPORTS)

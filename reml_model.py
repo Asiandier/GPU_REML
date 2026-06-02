@@ -34,6 +34,11 @@ class FitConfig:
     rare_sources: Sequence | None = None
     vc_block_sizes: Sequence[int] | None = None
     component_variant_indices: Sequence[Sequence[int]] | None = None
+    smile_w_files: Sequence[str] | None = None
+    smile_weight_matrices: Sequence[np.ndarray] | None = None
+    smile_normalization: str = "kernel_trace"
+    smile_check_psd: bool = True
+    smile_strict_coverage: bool = True
     standardization_overrides: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
     sample_mask: np.ndarray | None = None  # bool mask for sample subsetting
     call_width: int = 131072
@@ -262,11 +267,17 @@ class InfinitesimalREMLFitter:
         self._n_dense_streamers = 0
         self._has_sparse = False
         self._partitioned_streamer = None
+        self._smile_operator = None
         cpu_threads = _available_cpu_threads(cfg.cpu_threads)
         use_component_partition = (
             cfg.vc_block_sizes is not None
             or cfg.component_variant_indices is not None
         )
+        smile_w_files_present = cfg.smile_w_files is not None and len(cfg.smile_w_files) > 0
+        smile_matrices_present = (
+            cfg.smile_weight_matrices is not None and len(cfg.smile_weight_matrices) > 0
+        )
+        use_smile = bool(smile_w_files_present or smile_matrices_present)
         dense_standardization_overrides = (
             list(cfg.standardization_overrides)
             if cfg.standardization_overrides is not None
@@ -282,6 +293,12 @@ class InfinitesimalREMLFitter:
             raise ValueError(
                 "Use either vc_block_sizes or component_variant_indices, not both."
             )
+        if smile_w_files_present and smile_matrices_present:
+            raise ValueError("Use either smile_w_files or smile_weight_matrices, not both.")
+        if use_smile and use_component_partition:
+            raise ValueError("SMILE block-W mode cannot be combined with component partitioning.")
+        if use_smile and (cfg.rare_sources is not None or cfg.rare_bed_prefix):
+            raise ValueError("SMILE block-W mode is currently supported only for dense-only fits.")
 
         if use_component_partition:
             if cfg.rare_sources is not None or cfg.rare_bed_prefix:
@@ -309,7 +326,7 @@ class InfinitesimalREMLFitter:
                     component_variant_indices=cfg.component_variant_indices,
                     standardization_override=stats_override,
                     device=cfg.device,
-                    keep_host_stats=cfg.keep_host_stats,
+                    keep_host_stats=(cfg.keep_host_stats or use_smile),
                     build_threads=build_threads,
                     sample_mask=cfg.sample_mask,
                     ring_depth=cfg.ring_depth,
@@ -344,7 +361,7 @@ class InfinitesimalREMLFitter:
                     component_variant_indices=cfg.component_variant_indices,
                     standardization_override=stats_override,
                     device=cfg.device,
-                    keep_host_stats=cfg.keep_host_stats,
+                    keep_host_stats=(cfg.keep_host_stats or use_smile),
                     build_threads=build_threads,
                     sample_mask=cfg.sample_mask,
                     ring_depth=cfg.ring_depth,
@@ -420,6 +437,28 @@ class InfinitesimalREMLFitter:
 
         self._sparse_streamers = tuple(self.streamers[self._n_dense_streamers:]) if self._has_sparse else ()
         self._sparse_merged_global = None
+
+        if use_smile:
+            if self._n_dense_streamers != 1 or len(self.streamers) != 1:
+                raise ValueError("SMILE block-W mode requires exactly one dense genotype source.")
+            from .smile_block_w import SmileBlockWeightedOperator
+
+            if cfg.smile_weight_matrices is not None:
+                self._smile_operator = SmileBlockWeightedOperator(
+                    self.streamers[0],
+                    list(cfg.smile_weight_matrices),
+                    normalization=cfg.smile_normalization,
+                    strict_coverage=cfg.smile_strict_coverage,
+                    check_psd=cfg.smile_check_psd,
+                )
+            else:
+                self._smile_operator = SmileBlockWeightedOperator.from_weight_files(
+                    self.streamers[0],
+                    list(cfg.smile_w_files or ()),
+                    normalization=cfg.smile_normalization,
+                    strict_coverage=cfg.smile_strict_coverage,
+                    check_psd=cfg.smile_check_psd,
+                )
 
         if self._n_dense_streamers > 1:
             self._dense_call_plan = tuple(
@@ -513,7 +552,7 @@ class InfinitesimalREMLFitter:
             elif darr.ndim == 0:
                 atoms.append(darr)
             else:
-                atoms.append(darr.reshape(-1)[0])
+                atoms.append(jnp.mean(darr.reshape(-1)))
         if not atoms:
             return jnp.zeros((0,), dtype=jnp.float32)
         return jnp.stack(atoms).astype(jnp.float32)
@@ -605,6 +644,27 @@ class InfinitesimalREMLFitter:
         return conf
 
     def _assemble_reml_operators(self) -> _OperatorBundle:
+        if self._smile_operator is not None:
+            op = self._smile_operator
+
+            def K_mv(V, op=op):
+                return op.kv(V)
+
+            def weighted_hv(theta_g, theta_e, V, op=op):
+                return op.weighted_hv(theta_g, theta_e, V)
+
+            def stacked_kv(V, op=op):
+                out = op.kv(V)
+                return out[None, ...]
+
+            return _OperatorBundle(
+                K_mvs=(K_mv,),
+                diag_list=(op.diag(),),
+                weighted_hv=weighted_hv,
+                stacked_kv=stacked_kv,
+                projected_core_atoms=None,
+            )
+
         if self._partitioned_streamer is not None:
             st = self._partitioned_streamer
             K_mvs = [
@@ -855,6 +915,8 @@ class InfinitesimalREMLFitter:
             return None
         if self.cfg.precond_refresh_reldp <= 0.0:
             return None
+        if self._smile_operator is not None:
+            return None
         if len(ops.K_mvs) <= 1:
             return None
 
@@ -903,6 +965,9 @@ class InfinitesimalREMLFitter:
         alpha: jnp.ndarray,
         theta_g: jnp.ndarray,
     ) -> tuple[jnp.ndarray, ...]:
+        if self._smile_operator is not None:
+            return (self._smile_operator.snp_effects(alpha, theta_g),)
+
         if self._partitioned_streamer is not None:
             st = self._partitioned_streamer
             xt_alpha = st.xtv(alpha, normalize=False)
@@ -1188,6 +1253,7 @@ class InfinitesimalREMLFitter:
         self._has_sparse = False
         self._sparse_streamers = ()
         self._partitioned_streamer = None
+        self._smile_operator = None
 
     def fit_infinitesimal(
         self,

@@ -97,6 +97,23 @@ def parse_args():
         default=env("COMPONENT_SPEC", ""),
         help="Structured component spec (.json or .npz) with optional names/metadata for arbitrary single-file multi-GRM.",
     )
+    p.add_argument(
+        "--smile-w-files",
+        default=env("SMILE_W_FILES", ""),
+        help="Comma-separated block-diagonal SMILE W_i files (.rds/.npy/.npz/.csv/text), in SNP-block order.",
+    )
+    p.add_argument(
+        "--smile-normalization",
+        choices=["kernel_trace", "weight_trace", "none"],
+        default=env("SMILE_NORMALIZATION", "kernel_trace"),
+        help="SMILE kernel normalization. Default kernel_trace sets tr(Z W Z^T / c)=n.",
+    )
+    p.add_argument(
+        "--smile-no-psd-check",
+        action="store_true",
+        default=env("SMILE_NO_PSD_CHECK", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Disable eigenvalue PSD checks for SMILE W_i matrices.",
+    )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
     p.add_argument("--prediction-bed-prefix", default=env("PREDICTION_BED_PREFIX", ""),
@@ -163,6 +180,7 @@ def main():
     rare_bed_list = [b for b in args.rare_bed_prefix.split(",") if b]
     rare_pgen_prefix = args.rare_pgen_prefix.strip()
     vc_block_sizes = [int(x) for x in args.vc_block_sizes.split(",") if x.strip()]
+    smile_w_files = [x.strip() for x in args.smile_w_files.split(",") if x.strip()]
     component_spec_path = args.component_spec.strip()
     legacy_component_npz = args.component_indices_npz.strip()
     if component_spec_path and legacy_component_npz:
@@ -192,6 +210,14 @@ def main():
         )
     if vc_block_sizes and component_variant_indices:
         raise SystemExit("Use only one of --vc-block-sizes or --component-indices-npz.")
+    if smile_w_files and (vc_block_sizes or component_variant_indices):
+        raise SystemExit("SMILE block-W mode cannot be combined with component partitioning.")
+    if smile_w_files and (rare_bed_list or rare_pgen_prefix):
+        raise SystemExit("SMILE block-W mode is currently supported only for dense-only fits.")
+    if smile_w_files and _n_dense != 1:
+        raise SystemExit("SMILE block-W mode requires exactly one dense genotype input.")
+    if smile_w_files and len(bed_list) > 1:
+        raise SystemExit("SMILE block-W mode cannot be combined with multiple BED prefixes.")
     if vc_block_sizes or component_variant_indices:
         if _n_dense != 1:
             raise SystemExit("single-source component partitioning requires exactly one dense input.")
@@ -297,7 +323,9 @@ def main():
     plan = run_planner(
         n_samples=y_np.shape[0], p_list=p_list,
         n_grm=(
-            len(component_variant_indices)
+            1
+            if smile_w_files
+            else len(component_variant_indices)
             if component_variant_indices
             else len(vc_block_sizes)
             if vc_block_sizes
@@ -362,6 +390,13 @@ def main():
                 "single-stream multi-GRM enabled via %s; preconditioner disabled",
                 part_desc,
             )
+    if smile_w_files:
+        logger.info(
+            "SMILE block-W mode enabled with %d W block file(s); normalization=%s psd_check=%s",
+            len(smile_w_files),
+            args.smile_normalization,
+            not args.smile_no_psd_check,
+        )
 
     if sources is not None:
         cfg = FitConfig(
@@ -369,6 +404,9 @@ def main():
             rare_sources=rare_cfg_sources, rare_bed_prefix=rare_cfg_bed,
             vc_block_sizes=vc_block_sizes or None,
             component_variant_indices=component_variant_indices or None,
+            smile_w_files=smile_w_files or None,
+            smile_normalization=args.smile_normalization,
+            smile_check_psd=not args.smile_no_psd_check,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
@@ -386,6 +424,9 @@ def main():
             rare_sources=rare_cfg_sources, rare_bed_prefix=rare_cfg_bed,
             vc_block_sizes=vc_block_sizes or None,
             component_variant_indices=component_variant_indices or None,
+            smile_w_files=smile_w_files or None,
+            smile_normalization=args.smile_normalization,
+            smile_check_psd=not args.smile_no_psd_check,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,

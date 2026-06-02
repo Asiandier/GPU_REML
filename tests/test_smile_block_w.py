@@ -17,9 +17,12 @@ if PARENT not in sys.path:
 PKG = importlib.import_module(os.path.basename(REPO_ROOT))
 GENO_STREAM = importlib.import_module(f"{PKG.__name__}.geno_stream")
 SMILE = importlib.import_module(f"{PKG.__name__}.smile_block_w")
+REML_MODEL = importlib.import_module(f"{PKG.__name__}.reml_model")
 
 GenoBlockStreamer = GENO_STREAM.GenoBlockStreamer
 SmileBlockWeightedOperator = SMILE.SmileBlockWeightedOperator
+FitConfig = REML_MODEL.FitConfig
+InfinitesimalREMLFitter = REML_MODEL.InfinitesimalREMLFitter
 
 
 class _ArraySource:
@@ -146,6 +149,9 @@ def test_global_trace_normalization_sets_average_diagonal_to_one():
         assert trace_value / op.normalizer == pytest.approx(
             float(X.shape[0]), rel=2e-6, abs=2e-6
         )
+        diag = np.asarray(op.diag())
+        assert diag.shape == (X.shape[0],)
+        assert float(np.sum(diag)) == pytest.approx(float(X.shape[0]), rel=2e-6, abs=2e-6)
     finally:
         st.close()
 
@@ -177,6 +183,94 @@ def test_weighted_hv_uses_single_genetic_variance_component():
             op.weighted_hv(jnp.asarray([0.25, 0.4], dtype=jnp.float32), theta_e, V)
     finally:
         st.close()
+
+
+def test_snp_effects_include_block_weight_matrix():
+    X = _make_non_degenerate_genotypes(n=16, m=5, seed=212)
+    rng = np.random.RandomState(213)
+    A0 = rng.standard_normal((2, 2))
+    A1 = rng.standard_normal((3, 3))
+    W0 = A0 @ A0.T + 0.1 * np.eye(2)
+    W1 = A1 @ A1.T + 0.1 * np.eye(3)
+    alpha = jnp.asarray(rng.standard_normal((X.shape[0],)).astype(np.float32))
+    theta_g = jnp.asarray([0.3], dtype=jnp.float32)
+
+    st = GenoBlockStreamer(
+        _ArraySource(X),
+        call_width=3,
+        keep_host_stats=True,
+    )
+    try:
+        op = SmileBlockWeightedOperator(
+            st,
+            [W0, W1],
+            normalization="kernel_trace",
+            check_psd=True,
+        )
+        got = np.asarray(op.snp_effects(alpha, theta_g))
+        ref_parts = []
+        for block in op.blocks:
+            idx = np.arange(block.start, block.stop, dtype=np.int64)
+            Z = jnp.asarray(st.extract_standardized_columns(idx), dtype=jnp.float32)
+            W = jnp.asarray(block.matrix, dtype=jnp.float32)
+            ref_parts.append(theta_g[0] * (W @ (Z.T @ alpha)) / op.normalizer)
+        ref = np.asarray(jnp.concatenate(ref_parts, axis=0))
+        assert np.allclose(got, ref, atol=2e-3, rtol=5e-4)
+        assert np.allclose(
+            np.asarray(st.extract_standardized_columns(np.arange(st.m)) @ got),
+            np.asarray(theta_g[0] * op.kv(alpha)),
+            atol=3e-3,
+            rtol=5e-4,
+        )
+    finally:
+        st.close()
+
+
+def test_fitter_assembles_smile_single_kernel_reml_operator(monkeypatch):
+    X = _make_non_degenerate_genotypes(n=18, m=7, seed=210)
+    V = jnp.asarray(
+        np.random.RandomState(211).standard_normal((X.shape[0], 2)).astype(np.float32)
+    )
+
+    def _fake_fit_reml(*, y, K_mvs, diag_list, weighted_hv=None, stacked_kv=None, **_kwargs):
+        del y, _kwargs
+        assert len(K_mvs) == 1
+        assert len(diag_list) == 1
+        assert weighted_hv is not None
+        assert stacked_kv is not None
+
+        K_V = K_mvs[0](V)
+        stack = stacked_kv(V)
+        assert stack.shape == (1, X.shape[0], 2)
+        assert np.allclose(np.asarray(stack[0]), np.asarray(K_V), atol=2e-3, rtol=3e-4)
+
+        theta_g = jnp.asarray([0.25], dtype=jnp.float32)
+        theta_e = jnp.asarray(0.35, dtype=jnp.float32)
+        got_hv = weighted_hv(theta_g, theta_e, V)
+        ref_hv = theta_e * V + theta_g[0] * K_V
+        assert np.allclose(np.asarray(got_hv), np.asarray(ref_hv), atol=2e-3, rtol=3e-4)
+
+        diag = np.asarray(diag_list[0])
+        assert diag.shape == (X.shape[0],)
+        assert float(np.sum(diag)) == pytest.approx(float(X.shape[0]), rel=2e-6, abs=2e-6)
+        return jnp.asarray([0.2, 0.8], dtype=jnp.float32), [{"iter": 1}]
+
+    monkeypatch.setattr(f"{PKG.__name__}.reml_model.fit_reml", _fake_fit_reml)
+
+    cfg = FitConfig(
+        sources=[_ArraySource(X)],
+        smile_weight_matrices=[np.eye(3), np.eye(4)],
+        call_width=3,
+        keep_host_stats=False,
+        precond_rank=0,
+        verbose=False,
+    )
+    fitter = InfinitesimalREMLFitter(cfg)
+    try:
+        res = fitter.fit_infinitesimal(jnp.asarray(X[:, 0], dtype=jnp.float32))
+        assert np.allclose(np.asarray(res.var_components), [0.2, 0.8])
+    finally:
+        fitter.close()
 
 
 def test_rejects_non_psd_weight_matrix():

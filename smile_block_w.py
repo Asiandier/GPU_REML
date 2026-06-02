@@ -247,6 +247,7 @@ class SmileBlockWeightedOperator:
             raise ValueError("sources length must match weight_matrices length.")
 
         blocks: list[SmileBlockWeight] = []
+        raw_diag = np.zeros((int(streamer.n),), dtype=np.float64)
         start = 0
         for idx, raw_W in enumerate(weight_matrices):
             source = None if sources is None else sources[idx]
@@ -261,10 +262,15 @@ class SmileBlockWeightedOperator:
                 raise ValueError(
                     f"W[{idx}] with size {W.shape[0]} exceeds streamer.m={int(streamer.m)}."
                 )
-            trace_per_sample = self._compute_trace_per_sample(
+            diag_contrib = self._compute_diag_contribution(
                 streamer,
                 W,
                 start=start,
+            )
+            raw_diag += diag_contrib
+            trace_per_sample = self._compute_trace_per_sample(
+                diag_contrib,
+                W,
                 normalization=normalization,
             )
             blocks.append(
@@ -290,6 +296,8 @@ class SmileBlockWeightedOperator:
             [block.trace_per_sample for block in blocks],
             normalization=normalization,
         )
+        self._diag_host = np.asarray(raw_diag / float(self.normalizer), dtype=np.float32)
+        self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
         self.strict_coverage = bool(strict_coverage)
 
     @classmethod
@@ -303,11 +311,22 @@ class SmileBlockWeightedOperator:
         return cls(streamer, matrices, sources=[os.fspath(path) for path in paths], **kwargs)
 
     @staticmethod
-    def _compute_trace_per_sample(
+    def _compute_diag_contribution(
         streamer,
         W: np.ndarray,
         *,
         start: int,
+    ) -> np.ndarray:
+        idx = np.arange(int(start), int(start + W.shape[0]), dtype=np.int64)
+        Z = np.asarray(streamer.extract_standardized_columns(idx), dtype=np.float32, order="C")
+        weighted = Z @ np.asarray(W, dtype=np.float32)
+        return np.sum(weighted * Z, axis=1, dtype=np.float64)
+
+    @staticmethod
+    def _compute_trace_per_sample(
+        diag_contrib: np.ndarray,
+        W: np.ndarray,
+        *,
         normalization: Normalization,
     ) -> float:
         if normalization == "none":
@@ -315,9 +334,8 @@ class SmileBlockWeightedOperator:
         if normalization == "weight_trace":
             value = float(np.trace(np.asarray(W, dtype=np.float64)))
         else:
-            idx = np.arange(int(start), int(start + W.shape[0]), dtype=np.int64)
-            Z = np.asarray(streamer.extract_standardized_columns(idx), dtype=np.float64)
-            value = float(np.sum((Z @ np.asarray(W, dtype=np.float64)) * Z) / float(streamer.n))
+            diag_arr = np.asarray(diag_contrib, dtype=np.float64)
+            value = float(np.sum(diag_arr) / float(diag_arr.size))
         if not np.isfinite(value) or value <= 0.0:
             raise ValueError(f"Invalid SMILE block trace contribution: {value!r}.")
         return value
@@ -338,6 +356,11 @@ class SmileBlockWeightedOperator:
     @property
     def n_blocks(self) -> int:
         return len(self.blocks)
+
+    def diag(self) -> jnp.ndarray:
+        """Return ``diag(Z W Z.T / c)`` without forming the dense kernel."""
+
+        return self._diag_dev
 
     def _weighted_scores(
         self,
@@ -440,3 +463,29 @@ class SmileBlockWeightedOperator:
         if theta_e is not None:
             out = out + jnp.asarray(theta_e, dtype=V_dev.dtype) * V_dev
         return out[:, 0] if squeeze else out
+
+    def snp_effects(self, alpha: jnp.ndarray, theta_g: jnp.ndarray) -> jnp.ndarray:
+        """Return beta such that ``Z @ beta = theta_g * K @ alpha``."""
+
+        theta_g_arr = jnp.asarray(theta_g)
+        if theta_g_arr.ndim == 0:
+            theta_g_scalar = theta_g_arr
+        elif theta_g_arr.ndim == 1 and int(theta_g_arr.shape[0]) == 1:
+            theta_g_scalar = theta_g_arr[0]
+        else:
+            raise ValueError("theta_g must be a scalar or a length-one array for SMILE block-W.")
+        alpha_dev = jax.device_put(jnp.asarray(alpha), self.streamer.dev)
+        Xtalpha = self.streamer.xtv(alpha_dev, normalize=False)
+        if Xtalpha.ndim != 1:
+            if int(Xtalpha.shape[1]) != 1:
+                raise ValueError("snp_effects expects a single alpha vector.")
+            Xtalpha = Xtalpha[:, 0]
+
+        fp = Xtalpha.dtype
+        beta = jnp.zeros((int(self.streamer.m),), dtype=fp)
+        scale = jnp.asarray(theta_g_scalar, dtype=fp) / jnp.asarray(self.normalizer, dtype=fp)
+        for block in self.blocks:
+            W_dev = jax.device_put(jnp.asarray(block.matrix, dtype=fp), self.streamer.dev)
+            local = scale * (W_dev @ Xtalpha[block.start : block.stop])
+            beta = beta.at[block.start : block.stop].set(local)
+        return beta

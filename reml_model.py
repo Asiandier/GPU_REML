@@ -35,7 +35,13 @@ class FitConfig:
     vc_block_sizes: Sequence[int] | None = None
     component_variant_indices: Sequence[Sequence[int]] | None = None
     smile_w_files: Sequence[str] | None = None
+    smile_w_file_groups: Sequence[Sequence[str]] | None = None
     smile_weight_matrices: Sequence[np.ndarray] | None = None
+    smile_weight_matrix_groups: Sequence[Sequence[np.ndarray]] | None = None
+    smile_trace_per_sample_values: Sequence[float | None] | None = None
+    smile_trace_per_sample_groups: Sequence[Sequence[float | None]] | None = None
+    smile_identity: bool = False
+    smile_identity_block_size: int | None = None
     smile_normalization: str = "kernel_trace"
     smile_check_psd: bool = True
     smile_strict_coverage: bool = True
@@ -268,16 +274,30 @@ class InfinitesimalREMLFitter:
         self._has_sparse = False
         self._partitioned_streamer = None
         self._smile_operator = None
+        self._smile_operators = ()
         cpu_threads = _available_cpu_threads(cfg.cpu_threads)
         use_component_partition = (
             cfg.vc_block_sizes is not None
             or cfg.component_variant_indices is not None
         )
         smile_w_files_present = cfg.smile_w_files is not None and len(cfg.smile_w_files) > 0
+        smile_w_file_groups_present = (
+            cfg.smile_w_file_groups is not None and len(cfg.smile_w_file_groups) > 0
+        )
         smile_matrices_present = (
             cfg.smile_weight_matrices is not None and len(cfg.smile_weight_matrices) > 0
         )
-        use_smile = bool(smile_w_files_present or smile_matrices_present)
+        smile_matrix_groups_present = (
+            cfg.smile_weight_matrix_groups is not None
+            and len(cfg.smile_weight_matrix_groups) > 0
+        )
+        use_smile = bool(
+            cfg.smile_identity
+            or smile_w_files_present
+            or smile_w_file_groups_present
+            or smile_matrices_present
+            or smile_matrix_groups_present
+        )
         dense_standardization_overrides = (
             list(cfg.standardization_overrides)
             if cfg.standardization_overrides is not None
@@ -295,6 +315,21 @@ class InfinitesimalREMLFitter:
             )
         if smile_w_files_present and smile_matrices_present:
             raise ValueError("Use either smile_w_files or smile_weight_matrices, not both.")
+        smile_modes = sum(
+            bool(x)
+            for x in (
+                cfg.smile_identity,
+                smile_w_files_present,
+                smile_w_file_groups_present,
+                smile_matrices_present,
+                smile_matrix_groups_present,
+            )
+        )
+        if smile_modes > 1:
+            raise ValueError(
+                "Use only one SMILE W mode: identity, single W list, W file groups, "
+                "single matrix list, or matrix groups."
+            )
         if use_smile and use_component_partition:
             raise ValueError("SMILE block-W mode cannot be combined with component partitioning.")
         if use_smile and (cfg.rare_sources is not None or cfg.rare_bed_prefix):
@@ -441,24 +476,58 @@ class InfinitesimalREMLFitter:
         if use_smile:
             if self._n_dense_streamers != 1 or len(self.streamers) != 1:
                 raise ValueError("SMILE block-W mode requires exactly one dense genotype source.")
-            from .smile_block_w import SmileBlockWeightedOperator
+            from .smile_block_w import SmileBlockWeightedOperator, SmileMultiBlockWeightedOperator
 
-            if cfg.smile_weight_matrices is not None:
-                self._smile_operator = SmileBlockWeightedOperator(
+            if cfg.smile_identity:
+                self._smile_operators = (
+                    SmileBlockWeightedOperator.identity(
+                        self.streamers[0],
+                        block_size=cfg.smile_identity_block_size,
+                        normalization=cfg.smile_normalization,
+                        strict_coverage=cfg.smile_strict_coverage,
+                    ),
+                )
+            elif cfg.smile_weight_matrix_groups is not None:
+                multi_op = SmileMultiBlockWeightedOperator.from_weight_matrix_groups(
                     self.streamers[0],
-                    list(cfg.smile_weight_matrices),
+                    list(cfg.smile_weight_matrix_groups),
                     normalization=cfg.smile_normalization,
                     strict_coverage=cfg.smile_strict_coverage,
                     check_psd=cfg.smile_check_psd,
+                    trace_per_sample_groups=cfg.smile_trace_per_sample_groups,
+                )
+                self._smile_operators = multi_op.operators
+            elif cfg.smile_w_file_groups is not None:
+                multi_op = SmileMultiBlockWeightedOperator.from_weight_file_groups(
+                    self.streamers[0],
+                    list(cfg.smile_w_file_groups),
+                    normalization=cfg.smile_normalization,
+                    strict_coverage=cfg.smile_strict_coverage,
+                    check_psd=cfg.smile_check_psd,
+                )
+                self._smile_operators = multi_op.operators
+            elif cfg.smile_weight_matrices is not None:
+                self._smile_operators = (
+                    SmileBlockWeightedOperator(
+                        self.streamers[0],
+                        list(cfg.smile_weight_matrices),
+                        normalization=cfg.smile_normalization,
+                        strict_coverage=cfg.smile_strict_coverage,
+                        check_psd=cfg.smile_check_psd,
+                        trace_per_sample_values=cfg.smile_trace_per_sample_values,
+                    ),
                 )
             else:
-                self._smile_operator = SmileBlockWeightedOperator.from_weight_files(
-                    self.streamers[0],
-                    list(cfg.smile_w_files or ()),
-                    normalization=cfg.smile_normalization,
-                    strict_coverage=cfg.smile_strict_coverage,
-                    check_psd=cfg.smile_check_psd,
+                self._smile_operators = (
+                    SmileBlockWeightedOperator.from_weight_files(
+                        self.streamers[0],
+                        list(cfg.smile_w_files or ()),
+                        normalization=cfg.smile_normalization,
+                        strict_coverage=cfg.smile_strict_coverage,
+                        check_psd=cfg.smile_check_psd,
+                    ),
                 )
+            self._smile_operator = self._smile_operators[0] if self._smile_operators else None
 
         if self._n_dense_streamers > 1:
             self._dense_call_plan = tuple(
@@ -644,25 +713,103 @@ class InfinitesimalREMLFitter:
         return conf
 
     def _assemble_reml_operators(self) -> _OperatorBundle:
-        if self._smile_operator is not None:
-            op = self._smile_operator
+        if self._smile_operators:
+            ops = tuple(self._smile_operators)
 
-            def K_mv(V, op=op):
-                return op.kv(V)
+            K_mvs = tuple(
+                (lambda V, op=op: op.kv(V))
+                for op in ops
+            )
 
-            def weighted_hv(theta_g, theta_e, V, op=op):
-                return op.weighted_hv(theta_g, theta_e, V)
+            def weighted_hv(theta_g, theta_e, V, ops=ops):
+                theta_g_arr = jnp.asarray(theta_g)
+                if theta_g_arr.ndim != 1 or int(theta_g_arr.shape[0]) != len(ops):
+                    raise ValueError(
+                        f"theta_g must have length {len(ops)} for SMILE multi-GRM."
+                    )
+                squeeze = V.ndim == 1
+                if squeeze:
+                    V_work = V[:, None]
+                else:
+                    V_work = V
+                st = ops[0].streamer
+                V_dev = jax.device_put(jnp.asarray(V_work), st.dev)
+                XtV = st.xtv(V_dev, normalize=False)
+                if XtV.ndim == 1:
+                    XtV = XtV[:, None]
+                fp = V_dev.dtype
+                scores = jnp.zeros((int(st.m), int(V_dev.shape[1])), dtype=fp)
+                for idx, op in enumerate(ops):
+                    scores = op._accumulate_weighted_scores_from_xtv(
+                        scores,
+                        XtV,
+                        fp=fp,
+                        scale=theta_g_arr[idx],
+                    )
+                from .smile_block_w import _zxm_impl_streamed
 
-            def stacked_kv(V, op=op):
-                out = op.kv(V)
-                return out[None, ...]
+                out = _zxm_impl_streamed(
+                    st,
+                    ops[0]._scores_by_call(scores),
+                    missing_val=int(st._missing_val),
+                )
+                if theta_e is not None:
+                    out = out + jnp.asarray(theta_e, dtype=fp) * V_dev
+                return out[:, 0] if squeeze else out
+
+            def _kv_from_shared_xtv(op, XtV, rhs_cols, fp, squeeze):
+                st = op.streamer
+                scores = jnp.zeros((int(st.m), int(rhs_cols)), dtype=fp)
+                scores = op._accumulate_weighted_scores_from_xtv(scores, XtV, fp=fp)
+                from .smile_block_w import _zxm_impl_streamed
+
+                out = _zxm_impl_streamed(
+                    st,
+                    op._scores_by_call(scores),
+                    missing_val=int(st._missing_val),
+                )
+                return out[:, 0] if squeeze else out
+
+            def stacked_kv(V, ops=ops):
+                squeeze = V.ndim == 1
+                V_work = V[:, None] if squeeze else V
+                st = ops[0].streamer
+                V_dev = jax.device_put(jnp.asarray(V_work), st.dev)
+                XtV = st.xtv(V_dev, normalize=False)
+                if XtV.ndim == 1:
+                    XtV = XtV[:, None]
+                fp = V_dev.dtype
+                return jnp.stack(
+                    [
+                        _kv_from_shared_xtv(op, XtV, int(V_dev.shape[1]), fp, squeeze)
+                        for op in ops
+                    ],
+                    axis=0,
+                )
+
+            def projected_core_atoms(U, ops=ops):
+                atoms = []
+                eye = jnp.eye(int(U.shape[1]), dtype=U.dtype)
+                st = ops[0].streamer
+                U_dev = jax.device_put(jnp.asarray(U), st.dev)
+                XtU = st.xtv(U_dev, normalize=False)
+                if XtU.ndim == 1:
+                    XtU = XtU[:, None]
+                fp = U_dev.dtype
+                for op in ops:
+                    KU = _kv_from_shared_xtv(op, XtU, int(U_dev.shape[1]), fp, False)
+                    atom = jnp.asarray(U_dev, dtype=KU.dtype).T @ KU
+                    atom = 0.5 * (atom + atom.T)
+                    diag_atom = jnp.mean(jnp.asarray(op.diag(), dtype=U.dtype).reshape(-1))
+                    atoms.append(atom - diag_atom.astype(U.dtype) * eye)
+                return jnp.stack(atoms, axis=0)
 
             return _OperatorBundle(
-                K_mvs=(K_mv,),
-                diag_list=(op.diag(),),
+                K_mvs=K_mvs,
+                diag_list=tuple(op.diag() for op in ops),
                 weighted_hv=weighted_hv,
                 stacked_kv=stacked_kv,
-                projected_core_atoms=None,
+                projected_core_atoms=projected_core_atoms,
             )
 
         if self._partitioned_streamer is not None:
@@ -915,7 +1062,7 @@ class InfinitesimalREMLFitter:
             return None
         if self.cfg.precond_refresh_reldp <= 0.0:
             return None
-        if self._smile_operator is not None:
+        if self._smile_operators:
             return None
         if len(ops.K_mvs) <= 1:
             return None
@@ -965,8 +1112,16 @@ class InfinitesimalREMLFitter:
         alpha: jnp.ndarray,
         theta_g: jnp.ndarray,
     ) -> tuple[jnp.ndarray, ...]:
-        if self._smile_operator is not None:
-            return (self._smile_operator.snp_effects(alpha, theta_g),)
+        if self._smile_operators:
+            theta_g_arr = jnp.asarray(theta_g)
+            if theta_g_arr.ndim != 1 or int(theta_g_arr.shape[0]) != len(self._smile_operators):
+                raise ValueError(
+                    f"theta_g must have length {len(self._smile_operators)} for SMILE effects."
+                )
+            return tuple(
+                op.snp_effects(alpha, theta_g_arr[idx])
+                for idx, op in enumerate(self._smile_operators)
+            )
 
         if self._partitioned_streamer is not None:
             st = self._partitioned_streamer
@@ -1254,6 +1409,7 @@ class InfinitesimalREMLFitter:
         self._sparse_streamers = ()
         self._partitioned_streamer = None
         self._smile_operator = None
+        self._smile_operators = ()
 
     def fit_infinitesimal(
         self,

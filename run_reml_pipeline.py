@@ -34,6 +34,7 @@ _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
 _effect_io_mod = importlib.import_module(f"{pkg_name}.effect_io")
 _pred_io_mod = importlib.import_module(f"{pkg_name}.prediction_io")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
+_smile_mod = importlib.import_module(f"{pkg_name}.smile_block_w")
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
 load_component_specs = _component_spec_mod.load_component_specs
@@ -42,6 +43,7 @@ load_covar_aligned = _data_mod.load_covar_aligned
 write_effect_outputs = _effect_io_mod.write_effect_outputs
 write_prediction_outputs = _pred_io_mod.write_prediction_outputs
 ensure_parent_dir = _io_utils_mod.ensure_parent_dir
+load_weight_matrix_shape = _smile_mod.load_weight_matrix_shape
 _source_mod = importlib.import_module(f"{pkg_name}.geno_source")
 PgenGenoSource = _source_mod.PgenGenoSource
 env = _common_mod.env
@@ -74,6 +76,21 @@ def _load_component_variant_indices(npz_path: str) -> list[np.ndarray]:
     ]
 
 
+def _parse_grm_groups(raw: str) -> list[list[str]]:
+    groups: list[list[str]] = []
+    for group_raw in raw.split(";"):
+        paths = [x.strip() for x in group_raw.split(",") if x.strip()]
+        if paths:
+            groups.append(paths)
+    return groups
+
+
+def _matrix_size_from_shape(shape: tuple[int, ...]) -> int:
+    if len(shape) != 2 or int(shape[0]) != int(shape[1]):
+        raise SystemExit(f"SMILE W matrix must be square, got shape {shape}.")
+    return int(shape[0])
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Run GPU-accelerated REML pipeline.")
     # Genotype input — exactly one of the two groups must be supplied
@@ -98,21 +115,48 @@ def parse_args():
         help="Structured component spec (.json or .npz) with optional names/metadata for arbitrary single-file multi-GRM.",
     )
     p.add_argument(
-        "--smile-w-files",
-        default=env("SMILE_W_FILES", ""),
-        help="Comma-separated block-diagonal SMILE W_i files (.rds/.npy/.npz/.csv/text), in SNP-block order.",
-    )
-    p.add_argument(
-        "--smile-normalization",
-        choices=["kernel_trace", "weight_trace", "none"],
-        default=env("SMILE_NORMALIZATION", "kernel_trace"),
-        help="SMILE kernel normalization. Default kernel_trace sets tr(Z W Z^T / c)=n.",
-    )
-    p.add_argument(
-        "--smile-no-psd-check",
+        "--smile",
         action="store_true",
-        default=env("SMILE_NO_PSD_CHECK", "").strip().lower() in {"1", "true", "yes", "on"},
-        help="Disable eigenvalue PSD checks for SMILE W_i matrices.",
+        default=env("SMILE", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Enable SMILE-method weighted GRM mode.",
+    )
+    p.add_argument(
+        "--w-files",
+        dest="w_files",
+        default=env("SMILE_W_FILES", ""),
+        help=(
+            "Comma-separated W_i files for one SMILE GRM, in SNP-block order."
+        ),
+    )
+    p.add_argument(
+        "--grm-groups",
+        dest="grm_groups",
+        default=env("SMILE_GRM_GROUPS", ""),
+        help=(
+            "Semicolon-separated GRM groups, with comma-separated W_i files inside each GRM. "
+            "Example: 'W1.rds,W2.rds;W3.rds' makes two SMILE GRMs where W1/W2 are summed inside GRM1."
+        ),
+    )
+    p.add_argument(
+        "--identity-w",
+        dest="identity_w",
+        action="store_true",
+        default=env("SMILE_IDENTITY_W", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Use W=I in SMILE mode without materializing the identity matrix.",
+    )
+    p.add_argument(
+        "--w-normalization",
+        dest="w_normalization",
+        choices=["kernel_trace", "weight_trace", "none"],
+        default=env("SMILE_W_NORMALIZATION", "kernel_trace"),
+        help="SMILE W-kernel normalization. Default kernel_trace sets tr(Z W Z^T / c)=n.",
+    )
+    p.add_argument(
+        "--no-w-psd-check",
+        dest="no_w_psd_check",
+        action="store_true",
+        default=env("SMILE_NO_W_PSD_CHECK", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Disable eigenvalue PSD checks for W_i matrices.",
     )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
@@ -180,7 +224,31 @@ def main():
     rare_bed_list = [b for b in args.rare_bed_prefix.split(",") if b]
     rare_pgen_prefix = args.rare_pgen_prefix.strip()
     vc_block_sizes = [int(x) for x in args.vc_block_sizes.split(",") if x.strip()]
-    smile_w_files = [x.strip() for x in args.smile_w_files.split(",") if x.strip()]
+    smile_w_files = [x.strip() for x in args.w_files.split(",") if x.strip()]
+    smile_w_file_groups = _parse_grm_groups(args.grm_groups)
+    smile_weight_matrices = None
+    smile_weight_matrix_groups = None
+    smile_w_block_sizes: list[int] = []
+    if smile_w_files:
+        smile_w_block_sizes = [
+            _matrix_size_from_shape(load_weight_matrix_shape(path))
+            for path in smile_w_files
+        ]
+    elif smile_w_file_groups:
+        smile_w_block_sizes = [
+            _matrix_size_from_shape(load_weight_matrix_shape(path))
+            for group in smile_w_file_groups
+            for path in group
+        ]
+    smile_inputs_present = bool(args.identity_w or smile_w_files or smile_w_file_groups)
+    use_smile = bool(args.smile or smile_inputs_present)
+    smile_n_grm = (
+        len(smile_w_file_groups)
+        if smile_w_file_groups
+        else 1
+        if (args.identity_w or smile_w_files)
+        else 0
+    )
     component_spec_path = args.component_spec.strip()
     legacy_component_npz = args.component_indices_npz.strip()
     if component_spec_path and legacy_component_npz:
@@ -210,13 +278,17 @@ def main():
         )
     if vc_block_sizes and component_variant_indices:
         raise SystemExit("Use only one of --vc-block-sizes or --component-indices-npz.")
-    if smile_w_files and (vc_block_sizes or component_variant_indices):
+    if use_smile and not smile_inputs_present:
+        raise SystemExit("SMILE mode requires one of --identity-w, --w-files, or --grm-groups.")
+    if sum(bool(x) for x in (args.identity_w, smile_w_files, smile_w_file_groups)) > 1:
+        raise SystemExit("Use only one of --identity-w, --w-files, or --grm-groups.")
+    if use_smile and (vc_block_sizes or component_variant_indices):
         raise SystemExit("SMILE block-W mode cannot be combined with component partitioning.")
-    if smile_w_files and (rare_bed_list or rare_pgen_prefix):
+    if use_smile and (rare_bed_list or rare_pgen_prefix):
         raise SystemExit("SMILE block-W mode is currently supported only for dense-only fits.")
-    if smile_w_files and _n_dense != 1:
+    if use_smile and _n_dense != 1:
         raise SystemExit("SMILE block-W mode requires exactly one dense genotype input.")
-    if smile_w_files and len(bed_list) > 1:
+    if use_smile and len(bed_list) > 1:
         raise SystemExit("SMILE block-W mode cannot be combined with multiple BED prefixes.")
     if vc_block_sizes or component_variant_indices:
         if _n_dense != 1:
@@ -323,8 +395,8 @@ def main():
     plan = run_planner(
         n_samples=y_np.shape[0], p_list=p_list,
         n_grm=(
-            1
-            if smile_w_files
+            smile_n_grm
+            if use_smile
             else len(component_variant_indices)
             if component_variant_indices
             else len(vc_block_sizes)
@@ -352,6 +424,8 @@ def main():
             else None
         ),
         arbitrary_component_partition=bool(component_variant_indices),
+        smile_mode=use_smile,
+        smile_w_block_sizes=smile_w_block_sizes or None,
     )
     planned_source_build_chunk_width = (
         plan.source_build_chunk_width if plan.source_build_chunk_width > 0 else None
@@ -390,12 +464,18 @@ def main():
                 "single-stream multi-GRM enabled via %s; preconditioner disabled",
                 part_desc,
             )
-    if smile_w_files:
+    if use_smile:
         logger.info(
-            "SMILE block-W mode enabled with %d W block file(s); normalization=%s psd_check=%s",
-            len(smile_w_files),
-            args.smile_normalization,
-            not args.smile_no_psd_check,
+            "SMILE block-W mode enabled with %s; normalization=%s psd_check=%s",
+            (
+                "identity W"
+                if args.identity_w
+                else f"{len(smile_w_file_groups)} W file group(s)"
+                if smile_w_file_groups
+                else f"{len(smile_w_files)} W block file(s)"
+            ),
+            args.w_normalization,
+            not args.no_w_psd_check,
         )
 
     if sources is not None:
@@ -405,8 +485,12 @@ def main():
             vc_block_sizes=vc_block_sizes or None,
             component_variant_indices=component_variant_indices or None,
             smile_w_files=smile_w_files or None,
-            smile_normalization=args.smile_normalization,
-            smile_check_psd=not args.smile_no_psd_check,
+            smile_w_file_groups=smile_w_file_groups or None,
+            smile_weight_matrices=smile_weight_matrices,
+            smile_weight_matrix_groups=smile_weight_matrix_groups,
+            smile_identity=args.identity_w,
+            smile_normalization=args.w_normalization,
+            smile_check_psd=not args.no_w_psd_check,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
@@ -425,8 +509,12 @@ def main():
             vc_block_sizes=vc_block_sizes or None,
             component_variant_indices=component_variant_indices or None,
             smile_w_files=smile_w_files or None,
-            smile_normalization=args.smile_normalization,
-            smile_check_psd=not args.smile_no_psd_check,
+            smile_w_file_groups=smile_w_file_groups or None,
+            smile_weight_matrices=smile_weight_matrices,
+            smile_weight_matrix_groups=smile_weight_matrix_groups,
+            smile_identity=args.identity_w,
+            smile_normalization=args.w_normalization,
+            smile_check_psd=not args.no_w_psd_check,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,

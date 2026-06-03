@@ -234,6 +234,8 @@ def run_planner(
     ring_depth: Optional[int] = None,
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
+    smile_mode: bool = False,
+    smile_w_block_sizes: Optional[Sequence[int]] = None,
 ) -> PlanResult:
     """Run GPU planner and return a PlanResult."""
     plan = suggest_call_width(
@@ -251,6 +253,8 @@ def run_planner(
         ring_depth=ring_depth,
         source_format=source_format,
         arbitrary_component_partition=arbitrary_component_partition,
+        smile_mode=smile_mode,
+        smile_w_block_sizes=smile_w_block_sizes,
     )
     if not plan.feasible:
         raise SystemExit(

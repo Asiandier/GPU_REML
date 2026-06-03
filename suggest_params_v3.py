@@ -61,6 +61,7 @@ class PlanResult:
     source_build_chunk_width: int = 0
     source_build_chunks: int = 0
     source_build_est_gib: float = 0.0
+    gpu_smile_extra_gib: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,22 @@ def _slq_live_bytes(
     )
 
 
+def _smile_extra_live_bytes(
+    total_p: int,
+    *,
+    rhs_cols: int,
+    max_w_block_size: int,
+) -> float:
+    if total_p <= 0 or rhs_cols <= 0:
+        return 0.0
+    m = int(total_p)
+    rhs = int(rhs_cols)
+    xtv_scores_and_call_layout = 3.0 * _mat_bytes(m, rhs)
+    local_scores = _mat_bytes(max(0, int(max_w_block_size)), rhs)
+    w_staging = float(_F32 * max(0, int(max_w_block_size)) ** 2)
+    return xtv_scores_and_call_layout + local_scores + w_staging
+
+
 def _allocator_pool_limit_bytes() -> Optional[float]:
     if os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "").strip().lower() == "platform":
         return None
@@ -394,6 +411,8 @@ def suggest_call_width(
     ring_depth: Optional[int] = None,
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
+    smile_mode: bool = False,
+    smile_w_block_sizes: Optional[Sequence[int]] = None,
 ) -> PlanResult:
     """
     GPU-only planner.
@@ -441,6 +460,20 @@ def suggest_call_width(
     total_p = sum(max(0, int(sz)) for sz in segment_sizes)
     precond_rank = min(_AUTO_PRECOND_FLOOR, max(0, n), max(0, total_p))
     p_cap = max(segment_sizes) if segment_sizes else _W_ALIGN
+    max_smile_w_block_size = (
+        max((max(0, int(x)) for x in (smile_w_block_sizes or ())), default=0)
+        if smile_mode
+        else 0
+    )
+
+    def _smile_extra(rhs_cols: int) -> float:
+        if not smile_mode:
+            return 0.0
+        return _smile_extra_live_bytes(
+            total_p,
+            rhs_cols=rhs_cols,
+            max_w_block_size=max_smile_w_block_size,
+        )
 
     def _estimate_live_peaks(width: int) -> tuple[float, float, float, float, float, float, float, float]:
         streamer_state, geom = _dense_streamer_state_bytes(
@@ -450,20 +483,32 @@ def suggest_call_width(
             n_grm=G,
         )
         precond_state = _projected_core_state_bytes(n, G, precond_rank)
-        build_basis = streamer_state + _basis_build_live_bytes(n, geom, precond_rank)
+        build_basis = (
+            streamer_state
+            + _basis_build_live_bytes(n, geom, precond_rank)
+            + _smile_extra(precond_rank + _PRECOND_BUILD_OVERSAMPLE)
+        )
         if component_block_sizes is not None:
-            build_atoms = streamer_state + _partitioned_atoms_live_bytes(
-                n,
-                geom,
-                n_grm=G,
-                rank=precond_rank,
+            build_atoms = (
+                streamer_state
+                + _partitioned_atoms_live_bytes(
+                    n,
+                    geom,
+                    n_grm=G,
+                    rank=precond_rank,
+                )
+                + _smile_extra(precond_rank)
             )
         else:
-            build_atoms = streamer_state + _generic_atoms_live_bytes(
-                n,
-                geom,
-                n_grm=G,
-                rank=precond_rank,
+            build_atoms = (
+                streamer_state
+                + _generic_atoms_live_bytes(
+                    n,
+                    geom,
+                    n_grm=G,
+                    rank=precond_rank,
+                )
+                + _smile_extra(precond_rank)
             )
         build_peak = max(build_basis, build_atoms)
         precompute_peak = streamer_state + _precompute_live_bytes(
@@ -473,7 +518,8 @@ def suggest_call_width(
             rank=precond_rank,
             n_covar=n_covar,
             n_rand_vec=n_rand_vec,
-        )
+        ) + _smile_extra(n_rand_vec)
+        solve_cols = max(n_covar + 1 + n_rand_vec, G + 1)
         solve_peak = streamer_state + _solve_live_bytes(
             n,
             geom,
@@ -481,7 +527,8 @@ def suggest_call_width(
             rank=precond_rank,
             n_covar=n_covar,
             n_rand_vec=n_rand_vec,
-        )
+        ) + _smile_extra(solve_cols)
+        proj_cols = n_rand_vec + 1
         projection_peak = streamer_state + _projection_live_bytes(
             n,
             geom,
@@ -489,14 +536,14 @@ def suggest_call_width(
             rank=precond_rank,
             n_covar=n_covar,
             n_rand_vec=n_rand_vec,
-        )
+        ) + _smile_extra(proj_cols)
         slq_peak = streamer_state + _slq_live_bytes(
             n,
             geom,
             n_grm=G,
             rank=precond_rank,
             slq_samples=max(1, int(slq_samples)),
-        )
+        ) + _smile_extra(max(1, int(slq_samples)))
         live_peak = max(build_peak, precompute_peak, solve_peak, projection_peak, slq_peak)
         return (
             streamer_state,
@@ -577,6 +624,10 @@ def suggest_call_width(
             source_build_chunk_width=source_build_chunk_width,
             source_build_chunks=source_build_chunks,
             source_build_est_gib=source_build_live_bytes / _GIB,
+            gpu_smile_extra_gib=(
+                _smile_extra(max(n_covar + 1 + n_rand_vec, G + 1)) / _GIB
+                if smile_mode else 0.0
+            ),
         )
 
     # ---- ring_depth: direct control, no CPU budget model ------------------
@@ -604,8 +655,13 @@ def suggest_call_width(
         f"slq_live={gpu_slq_peak/_GIB:.1f}GiB "
         f"streamer_state={streamer_state/_GIB:.2f}GiB "
         f"precond_state={precond_state/_GIB:.2f}GiB "
-        f"gpu_live_peak={gpu_peak/_GIB:.1f}GiB/{gpu_budget_gib:.1f}GiB "
     )
+    if smile_mode:
+        note += (
+            f"smile_extra~{_smile_extra(max(n_covar + 1 + n_rand_vec, G + 1))/_GIB:.2f}GiB "
+            f"max_w_block={max_smile_w_block_size} "
+        )
+    note += f"gpu_live_peak={gpu_peak/_GIB:.1f}GiB/{gpu_budget_gib:.1f}GiB "
     if allocator_pool_limit is not None:
         note += (
             f"allocator_pool_cap={allocator_pool_limit/_GIB:.1f}GiB "
@@ -650,4 +706,8 @@ def suggest_call_width(
         source_build_chunk_width=source_build_chunk_width,
         source_build_chunks=source_build_chunks,
         source_build_est_gib=source_build_live_bytes / _GIB,
+        gpu_smile_extra_gib=(
+            _smile_extra(max(n_covar + 1 + n_rand_vec, G + 1)) / _GIB
+            if smile_mode else 0.0
+        ),
     )

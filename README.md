@@ -249,9 +249,6 @@ gpu-reml-sparse \
   --out-prefix out/sparse_components
 ```
 
-Global inactive-SNP KKT checking is enabled by default. Use `--no-kkt-check`
-only when you intentionally want to skip the global KKT certification step.
-
 Continuous-trait marginal GWAS:
 
 ```bash

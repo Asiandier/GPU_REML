@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .pipeline_common import run_planner
+from .smile_block_w import default_w_device_cache_bytes
 
 _GIB = 1024**3
 _F32 = 4
@@ -29,6 +30,7 @@ def estimate_smile_extra_live_bytes(
     n_rand_vec: int,
     slq_samples: int,
     smile_w_block_sizes: Optional[Sequence[int]] = None,
+    w_device_cache_limit: float = 0.0,
 ) -> float:
     """Return a conservative SMILE workspace reserve in bytes."""
 
@@ -51,7 +53,15 @@ def estimate_smile_extra_live_bytes(
     xtv_scores_and_call_layout = 3.0 * _mat_bytes(total_p, rhs_cols)
     local_scores = _mat_bytes(max_w_block, rhs_cols)
     w_staging = float(_F32 * max_w_block * max_w_block)
-    return xtv_scores_and_call_layout + local_scores + w_staging
+    total_w_bytes = float(
+        sum(_mat_bytes(int(width), int(width)) for width in (smile_w_block_sizes or ()))
+    )
+    w_device_cache = (
+        total_w_bytes
+        if w_device_cache_limit > 0.0 and 0.0 < total_w_bytes <= float(w_device_cache_limit)
+        else 0.0
+    )
+    return xtv_scores_and_call_layout + local_scores + w_staging + w_device_cache
 
 
 def run_smile_planner(
@@ -76,6 +86,14 @@ def run_smile_planner(
 
     total_p = sum(max(0, int(x)) for x in p_list)
     G = int(n_grm) if n_grm is not None else max(1, len(p_list))
+    base_budget = (
+        float(gpu_budget)
+        if gpu_budget is not None
+        else float(gpu_free) * 0.85
+        if gpu_free is not None
+        else None
+    )
+    w_cache_limit = default_w_device_cache_bytes(base_budget)
     reserve = estimate_smile_extra_live_bytes(
         total_p=total_p,
         n_samples=n_samples,
@@ -84,13 +102,7 @@ def run_smile_planner(
         n_rand_vec=n_rand_vec,
         slq_samples=slq_samples,
         smile_w_block_sizes=smile_w_block_sizes,
-    )
-    base_budget = (
-        float(gpu_budget)
-        if gpu_budget is not None
-        else float(gpu_free) * 0.85
-        if gpu_free is not None
-        else None
+        w_device_cache_limit=w_cache_limit,
     )
     adjusted_budget = (
         max(0.0, float(base_budget) - reserve)
@@ -115,8 +127,10 @@ def run_smile_planner(
     )
     plan.note += (
         f" smile_extra_reserved={reserve / _GIB:.2f}GiB"
+        f" smile_w_device_cache_limit={w_cache_limit / _GIB:.2f}GiB"
         f" base_gpu_budget={base_budget / _GIB:.1f}GiB"
         if base_budget is not None
         else f" smile_extra_reserved={reserve / _GIB:.2f}GiB"
     )
+    plan.smile_w_device_cache_bytes = w_cache_limit
     return plan

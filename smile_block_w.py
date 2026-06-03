@@ -33,6 +33,8 @@ DiagMode = Literal["full", "mean"]
 _IDENTITY_TRACE_SCAN_TARGET_BYTES = 256 * 1024 * 1024
 _VALID_NORMALIZATIONS = ("kernel_trace", "effective_rank")
 _EFFECTIVE_RANK_KEYS = ("effective_rank", "retained_rank", "weight_rank", "rank")
+_W_DEVICE_CACHE_CAP_BYTES = 2 * 1024**3
+_W_DEVICE_CACHE_FRACTION = 0.10
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,6 +47,7 @@ class SmileBlockWeight:
     trace_per_sample: float
     source: str | None = None
     is_identity: bool = False
+    device_matrix: object | None = None
 
     @property
     def size(self) -> int:
@@ -53,6 +56,17 @@ class SmileBlockWeight:
     @property
     def stop(self) -> int:
         return int(self.start + self.size)
+
+
+def default_w_device_cache_bytes(gpu_budget_bytes: float | None) -> float:
+    """Return the default SMILE dense-W device cache limit."""
+
+    if gpu_budget_bytes is None:
+        return 0.0
+    budget = float(gpu_budget_bytes)
+    if not np.isfinite(budget) or budget <= 0.0:
+        return 0.0
+    return float(min(_W_DEVICE_CACHE_CAP_BYTES, _W_DEVICE_CACHE_FRACTION * budget))
 
 
 def load_rds_matrix(path: str | os.PathLike[str]) -> np.ndarray:
@@ -323,6 +337,7 @@ class SmileBlockWeightedOperator:
         start_offsets: Sequence[int] | None = None,
         effective_ranks: Sequence[float] | None = None,
         diag_mode: DiagMode = "full",
+        device_cache_max_bytes: float | None = None,
     ):
         if normalization not in _VALID_NORMALIZATIONS:
             raise ValueError(f"normalization must be one of {_VALID_NORMALIZATIONS}.")
@@ -340,6 +355,15 @@ class SmileBlockWeightedOperator:
         blocks: list[SmileBlockWeight] = []
         raw_diag = np.zeros((int(streamer.n),), dtype=np.float64) if diag_mode == "full" else None
         next_start = 0
+        cache_limit = float(device_cache_max_bytes or 0.0)
+        raw_w_bytes = 0.0
+        for raw_W in weight_matrices:
+            raw_shape = np.asarray(raw_W).shape
+            if len(raw_shape) == 2:
+                raw_w_bytes += float(
+                    int(raw_shape[0]) * int(raw_shape[1]) * np.dtype(np.float32).itemsize
+                )
+        cache_w_on_device = bool(cache_limit > 0.0 and raw_w_bytes <= cache_limit)
         for idx, raw_W in enumerate(weight_matrices):
             source = None if sources is None else sources[idx]
             W = validate_weight_matrix(
@@ -386,6 +410,11 @@ class SmileBlockWeightedOperator:
                     )
             if raw_diag is not None and diag_contrib is not None:
                 raw_diag += diag_contrib
+            W_dev = (
+                jax.device_put(jnp.asarray(W, dtype=jnp.float32), streamer.dev)
+                if cache_w_on_device
+                else None
+            )
             blocks.append(
                 SmileBlockWeight(
                     matrix=W,
@@ -393,6 +422,7 @@ class SmileBlockWeightedOperator:
                     size_value=int(W.shape[0]),
                     trace_per_sample=trace_per_sample,
                     source=source,
+                    device_matrix=W_dev,
                 )
             )
             next_start = stop
@@ -417,6 +447,7 @@ class SmileBlockWeightedOperator:
         self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
         self.strict_coverage = bool(strict_coverage)
         self.diag_mode = diag_mode
+        self.w_device_cache_bytes = raw_w_bytes if cache_w_on_device else 0.0
 
     @classmethod
     def identity(
@@ -665,7 +696,13 @@ class SmileBlockWeightedOperator:
             if block.is_identity:
                 local = XtV[block.start : block.stop, :]
             else:
-                W_dev = jax.device_put(jnp.asarray(block.matrix, dtype=fp), self.streamer.dev)
+                W_dev = (
+                    block.device_matrix
+                    if block.device_matrix is not None
+                    else jax.device_put(jnp.asarray(block.matrix, dtype=fp), self.streamer.dev)
+                )
+                if block.device_matrix is not None and W_dev.dtype != fp:
+                    W_dev = W_dev.astype(fp)
                 local = W_dev @ XtV[block.start : block.stop, :]
             local = scale_dev * local / normalizer_dev
             scores = scores.at[block.start : block.stop, :].add(local)
@@ -794,7 +831,13 @@ class SmileBlockWeightedOperator:
             if block.is_identity:
                 local = scale * Xtalpha[block.start : block.stop]
             else:
-                W_dev = jax.device_put(jnp.asarray(block.matrix, dtype=fp), self.streamer.dev)
+                W_dev = (
+                    block.device_matrix
+                    if block.device_matrix is not None
+                    else jax.device_put(jnp.asarray(block.matrix, dtype=fp), self.streamer.dev)
+                )
+                if block.device_matrix is not None and W_dev.dtype != fp:
+                    W_dev = W_dev.astype(fp)
                 local = scale * (W_dev @ Xtalpha[block.start : block.stop])
             beta = beta.at[block.start : block.stop].set(local)
         return beta
@@ -831,6 +874,7 @@ class SmileMultiBlockWeightedOperator:
         source_groups: Sequence[Sequence[str | None]] | None = None,
         effective_rank_groups: Sequence[Sequence[float]] | None = None,
         diag_mode: DiagMode = "full",
+        device_cache_max_bytes: float | None = None,
     ) -> "SmileMultiBlockWeightedOperator":
         groups = [list(group) for group in weight_matrix_groups]
         if not groups or any(len(group) == 0 for group in groups):
@@ -873,6 +917,7 @@ class SmileMultiBlockWeightedOperator:
                     start_offsets=starts,
                     effective_ranks=effective_ranks,
                     diag_mode=diag_mode,
+                    device_cache_max_bytes=device_cache_max_bytes,
                 )
             )
 

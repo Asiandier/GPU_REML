@@ -44,6 +44,7 @@ class FitConfig:
     smile_diag_mode: str = "mean"
     smile_check_psd: bool = True
     smile_strict_coverage: bool = True
+    smile_w_device_cache_bytes: float | None = None
     standardization_overrides: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
     sample_mask: np.ndarray | None = None  # bool mask for sample subsetting
     call_width: int = 131072
@@ -479,9 +480,18 @@ class InfinitesimalREMLFitter:
         if use_smile:
             if self._n_dense_streamers != 1 or len(self.streamers) != 1:
                 raise ValueError("SMILE block-W mode requires exactly one dense genotype source.")
-            from .smile_block_w import SmileBlockWeightedOperator, SmileMultiBlockWeightedOperator
+            from .smile_block_w import (
+                SmileBlockWeightedOperator,
+                SmileMultiBlockWeightedOperator,
+                default_w_device_cache_bytes,
+            )
 
             smile_build_t0 = time.time()
+            smile_w_cache_bytes = (
+                default_w_device_cache_bytes(cfg.gpu_budget_bytes)
+                if cfg.smile_w_device_cache_bytes is None
+                else float(cfg.smile_w_device_cache_bytes)
+            )
             if cfg.smile_identity:
                 self._smile_operators = (
                     SmileBlockWeightedOperator.identity(
@@ -500,6 +510,7 @@ class InfinitesimalREMLFitter:
                     strict_coverage=cfg.smile_strict_coverage,
                     check_psd=cfg.smile_check_psd,
                     diag_mode=cfg.smile_diag_mode,
+                    device_cache_max_bytes=smile_w_cache_bytes,
                 )
                 self._smile_operators = multi_op.operators
             elif cfg.smile_w_file_groups is not None:
@@ -510,6 +521,7 @@ class InfinitesimalREMLFitter:
                     strict_coverage=cfg.smile_strict_coverage,
                     check_psd=cfg.smile_check_psd,
                     diag_mode=cfg.smile_diag_mode,
+                    device_cache_max_bytes=smile_w_cache_bytes,
                 )
                 self._smile_operators = multi_op.operators
             elif cfg.smile_weight_matrices is not None:
@@ -521,6 +533,7 @@ class InfinitesimalREMLFitter:
                         strict_coverage=cfg.smile_strict_coverage,
                         check_psd=cfg.smile_check_psd,
                         diag_mode=cfg.smile_diag_mode,
+                        device_cache_max_bytes=smile_w_cache_bytes,
                     ),
                 )
             else:
@@ -532,14 +545,17 @@ class InfinitesimalREMLFitter:
                         strict_coverage=cfg.smile_strict_coverage,
                         check_psd=cfg.smile_check_psd,
                         diag_mode=cfg.smile_diag_mode,
+                        device_cache_max_bytes=smile_w_cache_bytes,
                     ),
                 )
             self._smile_operator = self._smile_operators[0] if self._smile_operators else None
             logger.info(
-                "SMILE operator construction done in %.2fs; n_grm=%d n_blocks=%d",
+                "SMILE operator construction done in %.2fs; n_grm=%d n_blocks=%d w_device_cache=%.2fGiB",
                 time.time() - smile_build_t0,
                 len(self._smile_operators),
                 sum(op.n_blocks for op in self._smile_operators),
+                sum(float(getattr(op, "w_device_cache_bytes", 0.0)) for op in self._smile_operators)
+                / 1024**3,
             )
 
         if self._n_dense_streamers > 1:

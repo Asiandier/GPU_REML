@@ -147,6 +147,44 @@ def test_weighted_blocks_match_explicit_matrix_reference():
         st.close()
 
 
+def test_weighted_operator_can_cache_w_on_device():
+    X = _make_non_degenerate_genotypes(n=20, m=5, seed=220)
+    rng = np.random.RandomState(221)
+    A0 = rng.standard_normal((2, 2))
+    A1 = rng.standard_normal((3, 3))
+    W0 = A0 @ A0.T + 0.05 * np.eye(2)
+    W1 = A1 @ A1.T + 0.05 * np.eye(3)
+    V = jnp.asarray(rng.standard_normal((X.shape[0], 2)).astype(np.float32))
+
+    st = GenoBlockStreamer(
+        _ArraySource(X),
+        call_width=3,
+        keep_host_stats=True,
+    )
+    try:
+        uncached = SmileBlockWeightedOperator(
+            st,
+            [W0, W1],
+            normalization="kernel_trace",
+            check_psd=True,
+            device_cache_max_bytes=0,
+        )
+        cached = SmileBlockWeightedOperator(
+            st,
+            [W0, W1],
+            normalization="kernel_trace",
+            check_psd=True,
+            device_cache_max_bytes=1024 * 1024,
+        )
+
+        assert cached.w_device_cache_bytes > 0.0
+        assert all(block.device_matrix is not None for block in cached.blocks)
+        assert all(block.device_matrix is None for block in uncached.blocks)
+        assert np.allclose(np.asarray(cached.kv(V)), np.asarray(uncached.kv(V)), atol=2e-4)
+    finally:
+        st.close()
+
+
 def test_global_trace_normalization_sets_average_diagonal_to_one():
     X = _make_non_degenerate_genotypes(n=18, m=7, seed=208)
     rng = np.random.RandomState(209)

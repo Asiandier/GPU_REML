@@ -80,7 +80,7 @@ The sparse fixed-effect path uses the fitted covariance `V(theta)` to define a
 penalized GLS likelihood over candidate SNP effects:
 
 $$
-(\hat\alpha_\lambda,\hat b_\lambda)=\arg\min_{\alpha,b}\left\{\frac{1}{2}(y-C\alpha-Z_Sb)^TV(\theta)^{-1}(y-C\alpha-Z_Sb)+\lambda\|b\|_1\right\}.
+(\hat\alpha_\lambda,\hat b_\lambda)=\arg\min_{\alpha,b}\frac{1}{2}(y-C\alpha-Z_Sb)^TV(\theta)^{-1}(y-C\alpha-Z_Sb)+\lambda\|b\|_1.
 $$
 
 ## Research Use Cases

@@ -46,10 +46,19 @@ K_g v = \frac{Z_g (Z_g^T v)}{m_{\mathrm{eff},g}}
 $$
 
 Genotype blocks are decoded on the host, streamed to the GPU, and multiplied in
-batches. REML evaluation is then built from block PCG solves,
-Hutchinson trace estimates, SLQ log-determinant estimates, constrained
-AI/Fisher updates, and projected-core preconditioning rather than dense GRM
-linear algebra.
+batches. For variance parameters `theta`, the covariance matrix and REML
+objective are
+
+$$V(\theta)=\sum_g\theta_gK_g+\theta_eI,\quad \ell_R(\theta)=-\frac{1}{2}\left[\log|V(\theta)|+\log|X^TV(\theta)^{-1}X|+y^TP(\theta)y\right]$$
+
+where
+
+$$P(\theta)=V(\theta)^{-1}-V(\theta)^{-1}X\left(X^TV(\theta)^{-1}X\right)^{-1}X^TV(\theta)^{-1}.$$
+
+Evaluating and optimizing this likelihood without explicit GRMs leads to the
+main numerical machinery in GPU_REML: block PCG solves, Hutchinson trace
+estimates, SLQ log-determinant estimates, constrained AI/Fisher updates, and
+projected-core preconditioning.
 
 The goal is not only to produce one whole-genome heritability number. GPU_REML is
 designed as a method-development workbench for comparing covariance

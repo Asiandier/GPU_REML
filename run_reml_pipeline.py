@@ -87,6 +87,23 @@ def _parse_grm_groups(raw: str) -> list[list[str]]:
     return groups
 
 
+def _read_w_files_list(path: str) -> list[str]:
+    path = path.strip()
+    if not path:
+        return []
+    try:
+        text = open(path, "r", encoding="utf-8").read()
+    except OSError as exc:
+        raise SystemExit(f"Failed to read --w-files-list {path!r}: {exc}") from exc
+    paths: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        paths.extend(x.strip() for x in line.split(",") if x.strip())
+    return paths
+
+
 def _matrix_size_from_shape(shape: tuple[int, ...]) -> int:
     if len(shape) != 2 or int(shape[0]) != int(shape[1]):
         raise SystemExit(f"SMILE W matrix must be square, got shape {shape}.")
@@ -128,6 +145,15 @@ def parse_args():
         default=env("SMILE_W_FILES", ""),
         help=(
             "Comma-separated W_i files for one SMILE GRM, in SNP-block order."
+        ),
+    )
+    p.add_argument(
+        "--w-files-list",
+        dest="w_files_list",
+        default=env("SMILE_W_FILES_LIST", ""),
+        help=(
+            "Text file containing W_i paths for one SMILE GRM. "
+            "Entries may be comma-separated or one path per line."
         ),
     )
     p.add_argument(
@@ -230,6 +256,11 @@ def main():
     rare_pgen_prefix = args.rare_pgen_prefix.strip()
     vc_block_sizes = [int(x) for x in args.vc_block_sizes.split(",") if x.strip()]
     smile_w_files = [x.strip() for x in args.w_files.split(",") if x.strip()]
+    smile_w_files_from_list = _read_w_files_list(args.w_files_list)
+    if smile_w_files and smile_w_files_from_list:
+        raise SystemExit("Use only one of --w-files or --w-files-list.")
+    if smile_w_files_from_list:
+        smile_w_files = smile_w_files_from_list
     smile_w_file_groups = _parse_grm_groups(args.grm_groups)
     smile_weight_matrices = None
     smile_weight_matrix_groups = None
@@ -284,9 +315,11 @@ def main():
     if vc_block_sizes and component_variant_indices:
         raise SystemExit("Use only one of --vc-block-sizes or --component-indices-npz.")
     if use_smile and not smile_inputs_present:
-        raise SystemExit("SMILE mode requires one of --identity-w, --w-files, or --grm-groups.")
+        raise SystemExit(
+            "SMILE mode requires one of --identity-w, --w-files, --w-files-list, or --grm-groups."
+        )
     if sum(bool(x) for x in (args.identity_w, smile_w_files, smile_w_file_groups)) > 1:
-        raise SystemExit("Use only one of --identity-w, --w-files, or --grm-groups.")
+        raise SystemExit("Use only one of --identity-w, --w-files/--w-files-list, or --grm-groups.")
     if use_smile and (vc_block_sizes or component_variant_indices):
         raise SystemExit("SMILE block-W mode cannot be combined with component partitioning.")
     if use_smile and (rare_bed_list or rare_pgen_prefix):

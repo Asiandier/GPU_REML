@@ -288,27 +288,6 @@ name components and carry metadata:
 NPZ specs are also supported for compact programmatic construction. See
 [docs/component_specs.md](docs/component_specs.md).
 
-## Outputs
-
-The REML pipeline prints estimated variance components and total heritability:
-
-```text
-var_components: [...]
-h2: ...
-```
-
-With `--compute-effects` and `--out-prefix`, GPU_REML writes:
-
-- fixed-effect estimates;
-- per-sample random effects;
-- component-level random effects;
-- SNP-effect tables for each component;
-- JSON metadata linking outputs to component definitions.
-
-Prediction inputs can reuse fitted effects on a matched test genotype source.
-GWAS output is a TSV with marginal effect estimates, standard errors, test
-statistics, p-values, allele frequency, and variant metadata.
-
 ## Python API
 
 ```python

@@ -28,7 +28,7 @@ import numpy as np
 
 from .kv_impl import _device_put_block, _unpack_impute_center
 
-Normalization = Literal["kernel_trace", "weight_trace", "none"]
+Normalization = Literal["kernel_trace"]
 _IDENTITY_TRACE_SCAN_TARGET_BYTES = 256 * 1024 * 1024
 
 
@@ -319,10 +319,8 @@ class SmileBlockWeightedOperator:
         start_offsets: Sequence[int] | None = None,
         trace_per_sample_values: Sequence[float | None] | None = None,
     ):
-        if normalization not in ("kernel_trace", "weight_trace", "none"):
-            raise ValueError(
-                "normalization must be one of 'kernel_trace', 'weight_trace', or 'none'."
-            )
+        if normalization != "kernel_trace":
+            raise ValueError("normalization must be 'kernel_trace'.")
         if not weight_matrices:
             raise ValueError("At least one weight matrix is required.")
         if sources is not None and len(sources) != len(weight_matrices):
@@ -374,7 +372,6 @@ class SmileBlockWeightedOperator:
             else:
                 trace_per_sample = self._compute_trace_per_sample(
                     diag_contrib,
-                    W,
                     normalization=normalization,
                 )
             raw_diag += diag_contrib
@@ -417,10 +414,8 @@ class SmileBlockWeightedOperator:
     ) -> "SmileBlockWeightedOperator":
         """Create the SMILE operator for W=I without materializing I."""
 
-        if normalization not in ("kernel_trace", "weight_trace", "none"):
-            raise ValueError(
-                "normalization must be one of 'kernel_trace', 'weight_trace', or 'none'."
-            )
+        if normalization != "kernel_trace":
+            raise ValueError("normalization must be 'kernel_trace'.")
         if block_size is None:
             block_size = cls._auto_identity_block_size(streamer, normalization=normalization)
         block_size = int(block_size)
@@ -430,30 +425,20 @@ class SmileBlockWeightedOperator:
             raise ValueError("streamer must contain at least one SNP.")
 
         blocks: list[SmileBlockWeight] = []
-        use_unit_diag = normalization == "weight_trace"
-        raw_diag = (
-            np.full((int(streamer.n),), float(streamer.m), dtype=np.float64)
-            if use_unit_diag
-            else np.zeros((int(streamer.n),), dtype=np.float64)
-        )
+        raw_diag = np.zeros((int(streamer.n),), dtype=np.float64)
         start = 0
         while start < int(streamer.m):
             size = min(block_size, int(streamer.m) - start)
-            if use_unit_diag:
-                diag_contrib = np.zeros((0,), dtype=np.float64)
-            else:
-                diag_contrib = cls._compute_diag_contribution(
-                    streamer,
-                    None,
-                    start=start,
-                    size=size,
-                )
-                raw_diag += diag_contrib
+            diag_contrib = cls._compute_diag_contribution(
+                streamer,
+                None,
+                start=start,
+                size=size,
+            )
+            raw_diag += diag_contrib
             trace_per_sample = cls._compute_trace_per_sample(
                 diag_contrib,
-                None,
                 normalization=normalization,
-                identity_size=size,
             )
             blocks.append(
                 SmileBlockWeight(
@@ -486,8 +471,6 @@ class SmileBlockWeightedOperator:
         *,
         normalization: Normalization,
     ) -> int:
-        if normalization == "weight_trace":
-            return int(streamer.m)
         bytes_per_value = np.dtype(np.float32).itemsize
         n = max(1, int(streamer.n))
         width = int(_IDENTITY_TRACE_SCAN_TARGET_BYTES // (n * bytes_per_value))
@@ -537,23 +520,11 @@ class SmileBlockWeightedOperator:
     @staticmethod
     def _compute_trace_per_sample(
         diag_contrib: np.ndarray,
-        W: np.ndarray | None,
         *,
         normalization: Normalization,
-        identity_size: int | None = None,
     ) -> float:
-        if normalization == "none":
-            return 0.0
-        if normalization == "weight_trace":
-            if W is None:
-                if identity_size is None:
-                    raise ValueError("identity_size is required for identity weight_trace.")
-                value = float(identity_size)
-            else:
-                value = float(np.trace(np.asarray(W, dtype=np.float64)))
-        else:
-            diag_arr = np.asarray(diag_contrib, dtype=np.float64)
-            value = float(np.sum(diag_arr) / float(diag_arr.size))
+        diag_arr = np.asarray(diag_contrib, dtype=np.float64)
+        value = float(np.sum(diag_arr) / float(diag_arr.size))
         if not np.isfinite(value) or value <= 0.0:
             raise ValueError(f"Invalid SMILE block trace contribution: {value!r}.")
         return value
@@ -564,8 +535,6 @@ class SmileBlockWeightedOperator:
         *,
         normalization: Normalization,
     ) -> float:
-        if normalization == "none":
-            return 1.0
         value = float(np.sum(np.asarray(trace_values, dtype=np.float64)))
         if not np.isfinite(value) or value <= 0.0:
             raise ValueError(f"Invalid SMILE global normalizer: {value!r}.")

@@ -107,31 +107,6 @@ def test_implicit_identity_operator_matches_existing_global_kv():
         st.close()
 
 
-def test_implicit_identity_weight_trace_uses_unit_diag_like_global_grm():
-    X = _make_non_degenerate_genotypes(n=20, m=9, seed=220)
-    V = jnp.asarray(
-        np.random.RandomState(221).standard_normal((X.shape[0], 2)).astype(np.float32)
-    )
-    st = GenoBlockStreamer(
-        _ArraySource(X),
-        call_width=4,
-        keep_host_stats=True,
-    )
-    try:
-        op = SmileBlockWeightedOperator.identity(
-            st,
-            block_size=4,
-            normalization="weight_trace",
-        )
-        assert op.normalizer == pytest.approx(float(X.shape[1]))
-        assert np.allclose(np.asarray(op.diag()), np.ones((X.shape[0],), dtype=np.float32))
-        got = np.asarray(op.kv(V))
-        ref = np.asarray(st.kv(V))
-        assert np.allclose(got, ref, atol=2e-3, rtol=3e-4)
-    finally:
-        st.close()
-
-
 def test_weighted_blocks_match_explicit_matrix_reference():
     X = _make_non_degenerate_genotypes(n=28, m=9, seed=203)
     rng = np.random.RandomState(204)

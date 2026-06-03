@@ -149,7 +149,7 @@ def parse_args():
     p.add_argument(
         "--w-normalization",
         dest="w_normalization",
-        choices=["kernel_trace", "weight_trace", "none"],
+        choices=["kernel_trace"],
         default=env("SMILE_W_NORMALIZATION", "kernel_trace"),
         help="SMILE W-kernel normalization. Default kernel_trace sets tr(Z W Z^T / c)=n.",
     )

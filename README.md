@@ -42,8 +42,8 @@ represented as a matrix-free genotype operator:
 K_g V = Z_g (Z_g.T V) / m_eff,g
 ```
 
-Genotype blocks are decoded on the host, streamed to the accelerator, and
-multiplied in GPU batches. REML evaluation is then built from block PCG solves,
+Genotype blocks are decoded on the host, streamed to the GPU, and multiplied in
+batches. REML evaluation is then built from block PCG solves,
 Hutchinson trace estimates, SLQ log-determinant estimates, constrained
 AI/Fisher updates, and projected-core preconditioning rather than dense GRM
 linear algebra.

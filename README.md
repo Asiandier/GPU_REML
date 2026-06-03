@@ -177,7 +177,8 @@ Multiple GRMs from multiple BED prefixes:
 gpu-reml \
   --bed-prefix /path/to/grm1,/path/to/grm2,/path/to/grm3 \
   --pheno-txt pheno.txt \
-  --covar-txt covar.txt
+  --covar-txt covar.txt \
+  --out-prefix out/multi_grm
 ```
 
 Arbitrary SNP components from one genotype file:

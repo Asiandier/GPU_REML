@@ -76,6 +76,13 @@ Each `W_{g,i}` is treated as an arbitrary dense block. Blocks inside one GRM are
 summed into one variance component; multiple GRM groups can be supplied when a
 multi-component REML model is desired.
 
+The sparse fixed-effect path uses the fitted covariance `V(theta)` to define a
+penalized GLS likelihood over candidate SNP effects:
+
+$$
+(\hat\alpha_\lambda,\hat b_\lambda)=\arg\min_{\alpha,b}\left\{\frac{1}{2}(y-C\alpha-Z_Sb)^TV(\theta)^{-1}(y-C\alpha-Z_Sb)+\lambda\|b\|_1\right\}.
+$$
+
 ## Research Use Cases
 
 GPU_REML is most useful when the scientific question requires more than a

@@ -11,7 +11,7 @@ language for estimating SNP heritability and asking how heritable signal is
 distributed across chromosomes, annotations, MAF bins, LD environments, or
 user-defined genomic regions.
 
-In the standard formulation, GPU_REML fits a continuous-trait linear mixed model
+In the standard formulation, GPU_REML fits a linear mixed model
 
 $$
 \begin{aligned}

@@ -340,36 +340,21 @@ the standard GRM operator by the block-diagonal weighted operator. This keeps th
 new covariance representation isolated from the ordinary single-GRM, multi-GRM,
 partitioned, and sparse paths.
 
-This is why most tuning parameters control either memory movement
-(`--call-width`, `--gpu-budget-gib`, `--ring-depth`) or randomized numerical
-accuracy (`--n-rand-vec`, `--slq-samples`, `--slq-m`, `--slq-mode`).
+For routine runs, the most important user-facing resource controls are the GPU
+budget and the genotype-streaming ring depth.
 
 ## Key Runtime Parameters
 
-- `--gpu-budget-gib`: memory budget used by the planner when choosing streamed
-  genotype call width, ring depth, and projected-core size. If omitted, the
-  planner uses the current free GPU memory.
-- `--call-width`: number of SNPs decoded and multiplied per streamed genotype
-  call. The default `0` lets the planner choose this from the GPU memory model.
-- `--ring-depth`: number of host staging buffers used for genotype streaming.
-  The default `0` lets the planner choose it.
-- `--n-rand-vec`: number of Hutchinson random vectors used for REML trace terms.
-- `--slq-samples` and `--slq-m`: number of stochastic Lanczos probes and Lanczos
-  steps used for log-determinant estimation.
-- `--slq-mode`: log-determinant mode; `projected_core_residual` uses the
-  projected-core preconditioner inside SLQ.
-- `--precond-refresh-reldp`: projected-core refresh threshold after an accepted
-  REML step.
-- `--no-w-psd-check`: skips positive-semidefinite checks for SMILE `W_i` blocks.
-
-Sparse REML plus LASSO also exposes:
-
-- `--pcg-tol` and `--max-pcg-iters`: tolerance and iteration cap for block PCG
-  solves involving `V(theta)`.
-- `--screen-topk`, `--candidate-k`, and `--max-active`: screening, candidate
-  set, and active-set sizes for the LASSO stage.
-- `--lasso-n-lambda` and `--lasso-lam-min-ratio`: LASSO path length and minimum
-  lambda ratio.
+- `--gpu-budget-gib`: planner-side GPU memory budget. This is the main knob for
+  controlling GPU memory peak. The planner uses it to choose the streamed SNP
+  call width and the size of GPU-resident work arrays, including REML random
+  probe blocks and projected-core state. If omitted or set to `0`, GPU_REML uses
+  the currently available GPU memory estimate.
+- `--ring-depth`: number of CPU-side staging buffers used for genotype
+  streaming. This is the main knob for controlling CPU memory peak during data
+  movement. Larger values can give smoother host-to-GPU streaming but allocate
+  more pinned/staging memory on the CPU. The default `0` lets the planner choose
+  a conservative value.
 
 ## Validation
 

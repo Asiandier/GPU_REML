@@ -35,6 +35,7 @@ _effect_io_mod = importlib.import_module(f"{pkg_name}.effect_io")
 _pred_io_mod = importlib.import_module(f"{pkg_name}.prediction_io")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _smile_mod = importlib.import_module(f"{pkg_name}.smile_block_w")
+_smile_planner_mod = importlib.import_module(f"{pkg_name}.smile_planner")
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
 load_component_specs = _component_spec_mod.load_component_specs
@@ -44,6 +45,7 @@ write_effect_outputs = _effect_io_mod.write_effect_outputs
 write_prediction_outputs = _pred_io_mod.write_prediction_outputs
 ensure_parent_dir = _io_utils_mod.ensure_parent_dir
 load_weight_matrix_shape = _smile_mod.load_weight_matrix_shape
+run_smile_planner = _smile_planner_mod.run_smile_planner
 _source_mod = importlib.import_module(f"{pkg_name}.geno_source")
 PgenGenoSource = _source_mod.PgenGenoSource
 env = _common_mod.env
@@ -392,7 +394,7 @@ def main():
     n_covar = int(X_np.shape[1]) if X_np is not None else 0
     cpu_threads, cpu_threads_src = resolve_cpu_threads(args.cpu_threads or None)
 
-    plan = run_planner(
+    planner_kwargs = dict(
         n_samples=y_np.shape[0], p_list=p_list,
         n_grm=(
             smile_n_grm
@@ -424,9 +426,14 @@ def main():
             else None
         ),
         arbitrary_component_partition=bool(component_variant_indices),
-        smile_mode=use_smile,
-        smile_w_block_sizes=smile_w_block_sizes or None,
     )
+    if use_smile:
+        plan = run_smile_planner(
+            **planner_kwargs,
+            smile_w_block_sizes=smile_w_block_sizes or None,
+        )
+    else:
+        plan = run_planner(**planner_kwargs)
     planned_source_build_chunk_width = (
         plan.source_build_chunk_width if plan.source_build_chunk_width > 0 else None
     )

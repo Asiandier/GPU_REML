@@ -292,45 +292,6 @@ class TestMultiGRM:
         assert plan.source_build_chunks == 0
         assert plan.source_build_est_gib == 0.0
 
-    def test_smile_mode_accounts_for_scores_and_weight_staging(self):
-        base = suggest_call_width(
-            n_samples=20_000,
-            p_list=[100_000],
-            n_grm=2,
-            gpu_free_bytes=float(24 * 2**30),
-            gpu_budget_bytes=float(24 * 2**30),
-            n_rand_vec=32,
-        )
-        smile = suggest_call_width(
-            n_samples=20_000,
-            p_list=[100_000],
-            n_grm=2,
-            gpu_free_bytes=float(24 * 2**30),
-            gpu_budget_bytes=float(24 * 2**30),
-            n_rand_vec=32,
-            smile_mode=True,
-            smile_w_block_sizes=[400, 600, 500],
-        )
-        assert smile.feasible
-        assert smile.gpu_peak_gib >= base.gpu_peak_gib
-        assert smile.gpu_smile_extra_gib > 0.0
-        assert "smile_extra~" in smile.note
-        assert "max_w_block=600" in smile.note
-
-    def test_smile_identity_mode_accounts_for_score_workspace(self):
-        plan = suggest_call_width(
-            n_samples=10_000,
-            p_list=[50_000],
-            n_grm=1,
-            gpu_free_bytes=float(16 * 2**30),
-            gpu_budget_bytes=float(16 * 2**30),
-            n_rand_vec=16,
-            smile_mode=True,
-        )
-        assert plan.feasible
-        assert plan.gpu_smile_extra_gib > 0.0
-        assert "max_w_block=0" in plan.note
-
 
 class TestRegression:
     def test_solve_live_bytes_accounts_for_ai_rhs_width(self):

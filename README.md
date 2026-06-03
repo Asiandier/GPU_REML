@@ -218,17 +218,39 @@ gpu-reml \
   --out-prefix out/smile_multi
 ```
 
-Sparse REML plus LASSO:
+Sparse REML plus LASSO, single GRM:
 
 ```bash
 gpu-reml-sparse \
-  --bed-prefix /path/to/common \
+  --bed-prefix /path/to/data \
+  --pheno-txt pheno.txt \
+  --covar-txt covar.txt \
+  --out-prefix out/sparse_single
+```
+
+Sparse REML plus LASSO, multiple BED prefixes as multiple GRMs:
+
+```bash
+gpu-reml-sparse \
+  --bed-prefix /path/to/grm1,/path/to/grm2,/path/to/grm3 \
+  --pheno-txt pheno.txt \
+  --covar-txt covar.txt \
+  --out-prefix out/sparse_multi_bed
+```
+
+Sparse REML plus LASSO, one genotype file partitioned into multiple GRMs:
+
+```bash
+gpu-reml-sparse \
+  --bed-prefix /path/to/data \
   --component-spec components.json \
   --pheno-txt pheno.txt \
   --covar-txt covar.txt \
-  --out-prefix out/sparse \
-  --kkt-check
+  --out-prefix out/sparse_components
 ```
+
+Global inactive-SNP KKT checking is enabled by default. Use `--no-kkt-check`
+only when you intentionally want to skip the global KKT certification step.
 
 Continuous-trait marginal GWAS:
 

@@ -236,9 +236,10 @@ Continuous-trait marginal GWAS:
 gpu-reml-gwas \
   --bed-prefix /path/to/data \
   --pheno-txt pheno.txt \
-  --covar-txt covar.txt \
   --out-prefix out/gwas
 ```
+
+Add `--covar-txt covar.txt` when covariates should be included.
 
 The repository-local `run_gpu.sh` launcher remains available for
 environment-heavy benchmark runs.

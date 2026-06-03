@@ -347,12 +347,8 @@ accuracy (`--n-rand-vec`, `--slq-samples`, `--slq-m`, `--pcg-tol`,
 
 ## Practical Guidance
 
-- Start with one GRM and modest randomized settings, then increase
-  `--n-rand-vec`, `--slq-samples`, and `--slq-m` for final runs.
 - Use `--gpu-budget-gib` when sharing a GPU or when JAX memory preallocation is
   undesirable.
-- Keep phenotype, covariate, sample filtering, and component definitions fixed
-  when comparing against GCTA, BOLT-REML, or other REML software.
 - For high-dimensional multi-GRM models, inspect boundary components and
   convergence history rather than relying only on the final `h2`.
 - For SMILE-style weighted models, start with small `W_i` blocks and

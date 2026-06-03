@@ -149,9 +149,12 @@ def parse_args():
     p.add_argument(
         "--w-normalization",
         dest="w_normalization",
-        choices=["kernel_trace"],
+        choices=["kernel_trace", "effective_rank"],
         default=env("SMILE_W_NORMALIZATION", "kernel_trace"),
-        help="SMILE W-kernel normalization. Default kernel_trace sets tr(Z W Z^T / c)=n.",
+        help=(
+            "SMILE W-kernel normalization. kernel_trace computes tr(Z W Z^T)/n; "
+            "effective_rank uses per-W sidecar JSON effective_rank values."
+        ),
     )
     p.add_argument(
         "--no-w-psd-check",

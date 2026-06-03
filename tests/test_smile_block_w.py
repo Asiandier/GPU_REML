@@ -184,6 +184,70 @@ def test_global_trace_normalization_sets_average_diagonal_to_one():
         st.close()
 
 
+def test_effective_rank_normalization_uses_sidecar_metadata(tmp_path):
+    X = _make_non_degenerate_genotypes(n=18, m=5, seed=241)
+    rng = np.random.RandomState(242)
+    W0 = np.eye(2, dtype=np.float32)
+    W1 = np.eye(3, dtype=np.float32)
+    paths = []
+    ranks = [1.5, 2.25]
+    for idx, (W, rank) in enumerate(zip((W0, W1), ranks)):
+        path = tmp_path / f"W{idx}.npy"
+        np.save(path, W)
+        path.with_suffix(".json").write_text(
+            json.dumps({"width": int(W.shape[0]), "effective_rank": rank}) + "\n"
+        )
+        paths.append(path)
+
+    V = jnp.asarray(rng.standard_normal((X.shape[0], 2)).astype(np.float32))
+    st = GenoBlockStreamer(
+        _ArraySource(X),
+        call_width=3,
+        keep_host_stats=True,
+    )
+    try:
+        op = SmileBlockWeightedOperator.from_weight_files(
+            st,
+            paths,
+            normalization="effective_rank",
+            check_psd=False,
+        )
+        assert op.normalizer == pytest.approx(sum(ranks), rel=1e-7)
+
+        ref = jnp.zeros_like(V)
+        for block in op.blocks:
+            idx = np.arange(block.start, block.stop, dtype=np.int64)
+            Z = jnp.asarray(st.extract_standardized_columns(idx), dtype=jnp.float32)
+            W = jnp.asarray(block.matrix, dtype=jnp.float32)
+            ref = ref + Z @ (W @ (Z.T @ V))
+        ref = ref / jnp.asarray(sum(ranks), dtype=jnp.float32)
+        assert np.allclose(np.asarray(op.kv(V)), np.asarray(ref), atol=2e-3, rtol=5e-4)
+    finally:
+        st.close()
+
+
+def test_effective_rank_normalization_requires_sidecar_metadata(tmp_path):
+    X = _make_non_degenerate_genotypes(n=12, m=2, seed=243)
+    path = tmp_path / "W.npy"
+    np.save(path, np.eye(2, dtype=np.float32))
+
+    st = GenoBlockStreamer(
+        _ArraySource(X),
+        call_width=2,
+        keep_host_stats=True,
+    )
+    try:
+        with pytest.raises(ValueError, match="sidecar JSON metadata"):
+            SmileBlockWeightedOperator.from_weight_files(
+                st,
+                [path],
+                normalization="effective_rank",
+                check_psd=False,
+            )
+    finally:
+        st.close()
+
+
 def test_mean_diag_mode_keeps_exact_normalizer_but_returns_scalar_diag():
     X = _make_non_degenerate_genotypes(n=18, m=7, seed=239)
     rng = np.random.RandomState(240)

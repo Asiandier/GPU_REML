@@ -329,8 +329,8 @@ class InfinitesimalREMLFitter:
                 "Use only one SMILE W mode: identity, single W list, W file groups, "
                 "single matrix list, or matrix groups."
             )
-        if use_smile and cfg.smile_normalization != "kernel_trace":
-            raise ValueError("SMILE normalization must be 'kernel_trace'.")
+        if use_smile and cfg.smile_normalization not in ("kernel_trace", "effective_rank"):
+            raise ValueError("SMILE normalization must be 'kernel_trace' or 'effective_rank'.")
         if use_smile and cfg.smile_diag_mode not in ("full", "mean"):
             raise ValueError("SMILE diag mode must be 'full' or 'mean'.")
         if use_smile and use_component_partition:

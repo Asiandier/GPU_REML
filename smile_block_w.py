@@ -28,9 +28,11 @@ import numpy as np
 
 from .kv_impl import _device_put_block, _unpack_impute_center
 
-Normalization = Literal["kernel_trace"]
+Normalization = Literal["kernel_trace", "effective_rank"]
 DiagMode = Literal["full", "mean"]
 _IDENTITY_TRACE_SCAN_TARGET_BYTES = 256 * 1024 * 1024
+_VALID_NORMALIZATIONS = ("kernel_trace", "effective_rank")
+_EFFECTIVE_RANK_KEYS = ("effective_rank", "retained_rank", "weight_rank", "rank")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,12 +128,8 @@ def load_weight_matrix_shape(path: str | os.PathLike[str]) -> tuple[int, int]:
     """Return a W matrix shape without reading the full dense payload when possible."""
 
     path = Path(path)
-    meta_path = path.with_suffix(".json")
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            meta = {}
+    meta = load_weight_matrix_metadata(path, required=False)
+    if meta:
         for key in ("shape", "matrix_shape"):
             if key in meta:
                 shape = tuple(int(x) for x in meta[key])
@@ -157,6 +155,29 @@ def load_weight_matrix_shape(path: str | os.PathLike[str]) -> tuple[int, int]:
             data.close()
     matrix = load_weight_matrix(path)
     return tuple(int(x) for x in np.asarray(matrix).shape)
+
+
+def load_weight_matrix_metadata(
+    path: str | os.PathLike[str],
+    *,
+    required: bool = False,
+) -> dict:
+    """Load optional sidecar metadata next to a W file."""
+
+    meta_path = Path(path).with_suffix(".json")
+    if not meta_path.exists():
+        if required:
+            raise ValueError(f"Missing sidecar JSON metadata for W file {os.fspath(path)!r}.")
+        return {}
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        if required:
+            raise ValueError(f"Failed to read sidecar JSON metadata {os.fspath(meta_path)!r}.") from exc
+        return {}
+    if not isinstance(meta, dict):
+        raise ValueError(f"Sidecar JSON metadata must be an object: {os.fspath(meta_path)!r}.")
+    return meta
 
 
 def _max_abs_symmetric_difference(W: np.ndarray, *, block_rows: int = 2048) -> float:
@@ -296,10 +317,11 @@ class SmileBlockWeightedOperator:
         check_psd: bool = True,
         sources: Sequence[str | None] | None = None,
         start_offsets: Sequence[int] | None = None,
+        effective_ranks: Sequence[float] | None = None,
         diag_mode: DiagMode = "full",
     ):
-        if normalization != "kernel_trace":
-            raise ValueError("normalization must be 'kernel_trace'.")
+        if normalization not in _VALID_NORMALIZATIONS:
+            raise ValueError(f"normalization must be one of {_VALID_NORMALIZATIONS}.")
         if diag_mode not in ("full", "mean"):
             raise ValueError("diag_mode must be 'full' or 'mean'.")
         if not weight_matrices:
@@ -308,6 +330,8 @@ class SmileBlockWeightedOperator:
             raise ValueError("sources length must match weight_matrices length.")
         if start_offsets is not None and len(start_offsets) != len(weight_matrices):
             raise ValueError("start_offsets length must match weight_matrices length.")
+        if effective_ranks is not None and len(effective_ranks) != len(weight_matrices):
+            raise ValueError("effective_ranks length must match weight_matrices length.")
 
         blocks: list[SmileBlockWeight] = []
         raw_diag = np.zeros((int(streamer.n),), dtype=np.float64) if diag_mode == "full" else None
@@ -332,19 +356,29 @@ class SmileBlockWeightedOperator:
                 raise ValueError(
                     f"W[{idx}] with size {W.shape[0]} exceeds streamer.m={int(streamer.m)}."
                 )
+            if normalization == "effective_rank":
+                trace_per_sample = self._effective_rank_contribution(
+                    source=source,
+                    explicit_rank=None if effective_ranks is None else effective_ranks[idx],
+                    width=int(W.shape[0]),
+                    block_name=f"W[{idx}]",
+                )
+
             if diag_mode == "full":
                 diag_contrib = self._compute_diag_contribution(streamer, W, start=start)
-                trace_per_sample = self._compute_trace_per_sample(
-                    diag_contrib,
-                    normalization=normalization,
-                )
+                if normalization == "kernel_trace":
+                    trace_per_sample = self._compute_trace_per_sample(
+                        diag_contrib,
+                        normalization=normalization,
+                    )
             else:
                 diag_contrib = None
-                trace_per_sample = self._compute_trace_per_sample_from_block(
-                    streamer,
-                    W,
-                    start=start,
-                )
+                if normalization == "kernel_trace":
+                    trace_per_sample = self._compute_trace_per_sample_from_block(
+                        streamer,
+                        W,
+                        start=start,
+                    )
             if raw_diag is not None and diag_contrib is not None:
                 raw_diag += diag_contrib
             blocks.append(
@@ -391,8 +425,8 @@ class SmileBlockWeightedOperator:
     ) -> "SmileBlockWeightedOperator":
         """Create the SMILE operator for W=I without materializing I."""
 
-        if normalization != "kernel_trace":
-            raise ValueError("normalization must be 'kernel_trace'.")
+        if normalization not in _VALID_NORMALIZATIONS:
+            raise ValueError(f"normalization must be one of {_VALID_NORMALIZATIONS}.")
         if diag_mode not in ("full", "mean"):
             raise ValueError("diag_mode must be 'full' or 'mean'.")
         if block_size is None:
@@ -408,6 +442,9 @@ class SmileBlockWeightedOperator:
         start = 0
         while start < int(streamer.m):
             size = min(block_size, int(streamer.m) - start)
+            if normalization == "effective_rank":
+                trace_per_sample = float(size)
+
             if diag_mode == "full":
                 diag_contrib = cls._compute_diag_contribution(
                     streamer,
@@ -416,17 +453,19 @@ class SmileBlockWeightedOperator:
                     size=size,
                 )
                 raw_diag += diag_contrib
-                trace_per_sample = cls._compute_trace_per_sample(
-                    diag_contrib,
-                    normalization=normalization,
-                )
+                if normalization == "kernel_trace":
+                    trace_per_sample = cls._compute_trace_per_sample(
+                        diag_contrib,
+                        normalization=normalization,
+                    )
             else:
-                trace_per_sample = cls._compute_trace_per_sample_from_block(
-                    streamer,
-                    None,
-                    start=start,
-                    size=size,
-                )
+                if normalization == "kernel_trace":
+                    trace_per_sample = cls._compute_trace_per_sample_from_block(
+                        streamer,
+                        None,
+                        start=start,
+                        size=size,
+                    )
             blocks.append(
                 SmileBlockWeight(
                     matrix=None,
@@ -482,6 +521,40 @@ class SmileBlockWeightedOperator:
             sources=[os.fspath(path) for path in paths],
             **kwargs,
         )
+
+    @staticmethod
+    def _effective_rank_contribution(
+        *,
+        source: str | None,
+        explicit_rank: float | None,
+        width: int,
+        block_name: str,
+    ) -> float:
+        if explicit_rank is None:
+            if source is None:
+                raise ValueError(
+                    f"{block_name} uses effective_rank normalization but has no sidecar "
+                    "metadata or explicit effective rank."
+                )
+            meta = load_weight_matrix_metadata(source, required=True)
+            for key in _EFFECTIVE_RANK_KEYS:
+                if key in meta:
+                    explicit_rank = meta[key]
+                    break
+            else:
+                raise ValueError(
+                    f"{block_name} sidecar metadata for effective_rank normalization must "
+                    f"contain one of {_EFFECTIVE_RANK_KEYS}."
+                )
+
+        value = float(explicit_rank)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Invalid effective rank for {block_name}: {explicit_rank!r}.")
+        if value > float(width) * (1.0 + 1e-6):
+            raise ValueError(
+                f"Invalid effective rank for {block_name}: {value:g} exceeds block width {width}."
+            )
+        return value
 
     @staticmethod
     def _compute_diag_contribution(
@@ -751,6 +824,7 @@ class SmileMultiBlockWeightedOperator:
         symmetrize: bool = True,
         check_psd: bool = True,
         source_groups: Sequence[Sequence[str | None]] | None = None,
+        effective_rank_groups: Sequence[Sequence[float]] | None = None,
         diag_mode: DiagMode = "full",
     ) -> "SmileMultiBlockWeightedOperator":
         groups = [list(group) for group in weight_matrix_groups]
@@ -758,6 +832,8 @@ class SmileMultiBlockWeightedOperator:
             raise ValueError("SMILE GRM groups must be non-empty.")
         if source_groups is not None and len(source_groups) != len(groups):
             raise ValueError("source_groups length must match weight_matrix_groups length.")
+        if effective_rank_groups is not None and len(effective_rank_groups) != len(groups):
+            raise ValueError("effective_rank_groups length must match weight_matrix_groups length.")
 
         operators: list[SmileBlockWeightedOperator] = []
         next_start = 0
@@ -773,6 +849,13 @@ class SmileMultiBlockWeightedOperator:
                 next_start += int(W_arr.shape[0])
 
             sources = None if source_groups is None else list(source_groups[group_idx])
+            effective_ranks = (
+                None if effective_rank_groups is None else list(effective_rank_groups[group_idx])
+            )
+            if effective_ranks is not None and len(effective_ranks) != len(group):
+                raise ValueError(
+                    f"effective_rank_groups[{group_idx}] length must match W group length."
+                )
             operators.append(
                 SmileBlockWeightedOperator(
                     streamer,
@@ -783,6 +866,7 @@ class SmileMultiBlockWeightedOperator:
                     check_psd=check_psd,
                     sources=sources,
                     start_offsets=starts,
+                    effective_ranks=effective_ranks,
                     diag_mode=diag_mode,
                 )
             )

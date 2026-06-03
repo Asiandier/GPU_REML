@@ -13,20 +13,23 @@ user-defined genomic regions.
 
 In the standard formulation, GPU_REML fits a continuous-trait linear mixed model
 
-```text
-y = X beta + u_1 + ... + u_G + e
-u_g ~ N(0, sigma_g^2 K_g)
-e   ~ N(0, sigma_e^2 I)
-```
+$$
+\begin{aligned}
+y &= X\beta + u_1 + \cdots + u_G + e, \\
+u_g &\sim \mathcal{N}(0, \sigma_g^2 K_g), \\
+e &\sim \mathcal{N}(0, \sigma_e^2 I).
+\end{aligned}
+$$
 
 where each `K_g` is a genotype-defined covariance component. With components
 normalized to a comparable per-sample scale, SNP heritability is estimated from
 the fitted variance components, for example
 
-```text
-h2 = (sigma_1^2 + ... + sigma_G^2) /
-     (sigma_1^2 + ... + sigma_G^2 + sigma_e^2)
-```
+$$
+h^2 =
+\frac{\sigma_1^2 + \cdots + \sigma_G^2}
+{\sigma_1^2 + \cdots + \sigma_G^2 + \sigma_e^2}
+$$
 
 and the individual `sigma_g^2` terms describe how genetic variance is allocated
 across the chosen genomic components.
@@ -38,9 +41,9 @@ therefore keeps the statistical REML model but changes how each `K_g` is applied
 numerically. Instead of materializing a GRM, each covariance component is
 represented as a matrix-free genotype operator:
 
-```text
-K_g V = Z_g (Z_g.T V) / m_eff,g
-```
+$$
+K_g V = \frac{Z_g (Z_g^T V)}{m_{\mathrm{eff},g}}
+$$
 
 Genotype blocks are decoded on the host, streamed to the GPU, and multiplied in
 batches. REML evaluation is then built from block PCG solves,
@@ -61,10 +64,13 @@ project. GPU_REML implements the part that matches its matrix-free REML engine:
 a block-diagonal SNP-space weight matrix `W`, evaluated without materializing
 the sample-space kernel:
 
-```text
-K_g V = (sum_i Z_{g,i} W_{g,i} Z_{g,i}.T V) / c_g
-c_g   = tr(sum_i Z_{g,i} W_{g,i} Z_{g,i}.T) / n
-```
+$$
+K_g V =
+\frac{\sum_i Z_{g,i} W_{g,i} Z_{g,i}^T V}{c_g},
+\qquad
+c_g =
+\frac{\operatorname{tr}\!\left(\sum_i Z_{g,i} W_{g,i} Z_{g,i}^T\right)}{n}
+$$
 
 Each `W_{g,i}` is treated as an arbitrary dense block. Blocks inside one GRM are
 summed into one variance component; multiple GRM groups can be supplied when a
@@ -125,14 +131,15 @@ preconditioned, and estimated at scale?"
 GPU_REML fits Gaussian linear mixed models with genotype-defined covariance
 components:
 
-```text
-y = X beta + u_1 + ... + u_G + e
-u_g ~ N(0, theta_g K_g)
-e   ~ N(0, theta_e I)
-
-K_g = Z_g Z_g.T / m_eff,g
-H(theta) = sum_g theta_g K_g + theta_e I
-```
+$$
+\begin{aligned}
+y &= X\beta + u_1 + \cdots + u_G + e, \\
+u_g &\sim \mathcal{N}(0, \theta_g K_g), \\
+e &\sim \mathcal{N}(0, \theta_e I), \\
+K_g &= \frac{Z_g Z_g^T}{m_{\mathrm{eff},g}}, \\
+H(\theta) &= \sum_g \theta_g K_g + \theta_e I.
+\end{aligned}
+$$
 
 The REML objective is evaluated without explicitly forming `K_g`, `H^-1`, or the
 REML projection matrix. Component operators supply the products needed by the
@@ -331,10 +338,15 @@ architecture: a matrix-free weighted kernel with block-diagonal `W`.
 
 For one weighted GRM, the model component is:
 
-```text
-K V = (Z_1 W_1 Z_1.T V + ... + Z_B W_B Z_B.T V) / c
-c   = tr(Z_1 W_1 Z_1.T + ... + Z_B W_B Z_B.T) / n
-```
+$$
+K V =
+\frac{Z_1 W_1 Z_1^T V + \cdots + Z_B W_B Z_B^T V}{c},
+\qquad
+c =
+\frac{\operatorname{tr}\!\left(
+Z_1 W_1 Z_1^T + \cdots + Z_B W_B Z_B^T
+\right)}{n}
+$$
 
 The normalization is computed exactly for the current genotype stream,
 standardization, and sample filter. It is not approximated by `tr(W)` and does
@@ -350,10 +362,14 @@ For multi-GRM SMILE models, `--grm-groups` defines the grouping:
 
 This creates two variance components:
 
-```text
-K_1 = (Z_1 W_1 Z_1.T + Z_2 W_2 Z_2.T) / c_1
-K_2 = (Z_3 W_3 Z_3.T + Z_4 W_4 Z_4.T + Z_5 W_5 Z_5.T) / c_2
-```
+$$
+\begin{aligned}
+K_1 &=
+\frac{Z_1 W_1 Z_1^T + Z_2 W_2 Z_2^T}{c_1}, \\
+K_2 &=
+\frac{Z_3 W_3 Z_3^T + Z_4 W_4 Z_4^T + Z_5 W_5 Z_5^T}{c_2}.
+\end{aligned}
+$$
 
 This path is intended for method development around local LD, block-wise
 effect-correlation models, and weighted covariance structures. Large dense
@@ -414,9 +430,9 @@ without rewriting the REML optimizer.
 
 At each REML step, GPU_REML needs repeated applications of:
 
-```text
-H(theta) V = theta_e V + sum_g theta_g K_g V
-```
+$$
+H(\theta)V = \theta_e V + \sum_g \theta_g K_g V
+$$
 
 The implementation builds this product from streamed genotype blocks. REML
 evaluation then combines:

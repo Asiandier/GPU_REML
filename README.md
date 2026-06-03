@@ -100,27 +100,54 @@ Typical use cases include:
 
 ## Installation
 
-Install from a local checkout:
+GPU_REML requires Python 3.10 or newer. For large runs, install a GPU-enabled
+JAX build before installing GPU_REML.
 
 ```bash
-python -m pip install /path/to/GPU_REML
+git clone https://github.com/Asiandier/GPU_REML.git
+cd GPU_REML
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 ```
 
-Optional PGEN support requires `pgenlib`:
+Install JAX for the local CUDA driver following the official
+[JAX installation guide](https://docs.jax.dev/en/latest/installation.html). For
+current NVIDIA CUDA pip wheels, the command is typically:
 
 ```bash
-python -m pip install "/path/to/GPU_REML[pgen]"
+python -m pip install -U "jax[cuda13]"
 ```
 
-For development:
+Then install GPU_REML:
 
 ```bash
-python -m pip install "/path/to/GPU_REML[dev]"
+python -m pip install -e .
 ```
 
-GPU runs require a JAX/JAXLIB installation compatible with the local CUDA
-driver. CPU execution works for tests and small examples, but large REML jobs
-are intended for GPU execution.
+Optional PGEN support:
+
+```bash
+python -m pip install -e ".[pgen]"
+```
+
+Development install:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+Check that JAX can see the GPU:
+
+```bash
+python - <<'PY'
+import jax
+print(jax.devices())
+PY
+```
+
+CPU-only JAX is sufficient for tests and small examples. Large REML jobs are
+intended for GPU execution.
 
 ## Quick Start
 

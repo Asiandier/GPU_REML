@@ -61,14 +61,13 @@ trace estimates, SLQ log-determinant estimates, constrained AI/Fisher updates,
 and projected-core preconditioning.
 
 The goal is not only to produce one whole-genome heritability number. GPU_REML is
-designed as a method-development workbench for comparing covariance
-representations: **single-GRM models, multi-GRM models, and weighted kernels
-that encode local SNP covariance or effect-correlation structure**.
-
-The repository also includes a SMILE-inspired weighted-GRM path, with explicit
-attribution to the original [JianqiaoWang/SMILE](https://github.com/JianqiaoWang/SMILE)
-project. GPU_REML implements the part that matches its matrix-free REML engine:
-a block-diagonal SNP-space weight matrix `W`, evaluated without materializing
+designed as a method-development workbench for comparing **single-GRM and
+multi-GRM covariance representations**. It also includes a SMILE-inspired
+weighted-GRM extension, with explicit attribution to the original
+[JianqiaoWang/SMILE](https://github.com/JianqiaoWang/SMILE) project. This path
+adapts the SMILE idea of introducing a SNP-space weight matrix `W` into the
+genetic covariance, while implementing the form that matches GPU_REML's
+matrix-free REML engine: a block-diagonal `W`, evaluated without materializing
 the sample-space kernel:
 
 $$K_g=\frac{X_gW_gX_g^T}{c_g},\quad W_g=\mathrm{blockdiag}(W_{g,1},\ldots,W_{g,B}),\quad c_g=\frac{\mathrm{tr}(X_gW_gX_g^T)}{n}$$

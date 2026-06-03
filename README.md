@@ -288,59 +288,6 @@ name components and carry metadata:
 NPZ specs are also supported for compact programmatic construction. See
 [docs/component_specs.md](docs/component_specs.md).
 
-## SMILE-Style Weighted GRMs
-
-The SMILE-related path is inspired by the original
-[JianqiaoWang/SMILE](https://github.com/JianqiaoWang/SMILE) R project. The
-original repository provides SMILE estimation routines and a genetic application
-interface using genotype data with a specified weight matrix `W` or block
-division.
-
-GPU_REML does not vendor or reimplement the full R package. Instead, it
-implements the part that fits naturally into GPU_REML's operator-based REML
-architecture: a matrix-free weighted kernel with block-diagonal `W`.
-
-For one weighted GRM, the model component is:
-
-$$
-K V =
-\frac{Z_1 W_1 Z_1^T V + \cdots + Z_B W_B Z_B^T V}{c},
-\qquad
-c =
-\frac{\mathrm{tr}\left(
-Z_1 W_1 Z_1^T + \cdots + Z_B W_B Z_B^T
-\right)}{n}
-$$
-
-The normalization is computed exactly for the current genotype stream,
-standardization, and sample filter. It is not approximated by `tr(W)` and does
-not require precomputed trace metadata. The implementation never materializes
-the `n x n` kernel; it streams genotype products, applies each dense `W_i` in
-SNP space, and then streams the result back through `Z_i`.
-
-For multi-GRM SMILE models, `--grm-groups` defines the grouping:
-
-```text
---grm-groups 'W_1,W_2;W_3,W_4,W_5'
-```
-
-This creates two variance components:
-
-$$
-\begin{aligned}
-K_1 &=
-\frac{Z_1 W_1 Z_1^T + Z_2 W_2 Z_2^T}{c_1}, \\
-K_2 &=
-\frac{Z_3 W_3 Z_3^T + Z_4 W_4 Z_4^T + Z_5 W_5 Z_5^T}{c_2}.
-\end{aligned}
-$$
-
-This path is intended for method development around local LD, block-wise
-effect-correlation models, and weighted covariance structures. Large dense
-`W_i` blocks are computationally expensive: exact trace initialization and each
-`W_i @ (Z_i.T V)` operation scale with the block width, so practical block sizes
-should be chosen with GPU memory and runtime in mind.
-
 ## Outputs
 
 The REML pipeline prints estimated variance components and total heritability:

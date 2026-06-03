@@ -550,12 +550,14 @@ class InfinitesimalREMLFitter:
                 )
             self._smile_operator = self._smile_operators[0] if self._smile_operators else None
             logger.info(
-                "SMILE operator construction done in %.2fs; n_grm=%d n_blocks=%d w_device_cache=%.2fGiB",
+                "SMILE operator construction done in %.2fs; n_grm=%d n_blocks=%d "
+                "w_device_cache=%.2fGiB w_buckets=%d",
                 time.time() - smile_build_t0,
                 len(self._smile_operators),
                 sum(op.n_blocks for op in self._smile_operators),
                 sum(float(getattr(op, "w_device_cache_bytes", 0.0)) for op in self._smile_operators)
                 / 1024**3,
+                sum(len(getattr(op, "_w_device_buckets", ())) for op in self._smile_operators),
             )
 
         if self._n_dense_streamers > 1:
@@ -775,11 +777,11 @@ class InfinitesimalREMLFitter:
                         fp=fp,
                         scale=theta_g_arr[idx],
                     )
-                from .smile_block_w import _zxm_impl_streamed
+                from .smile_block_w import _zxm_impl_streamed_from_scores
 
-                out = _zxm_impl_streamed(
+                out = _zxm_impl_streamed_from_scores(
                     st,
-                    ops[0]._scores_by_call(scores),
+                    scores,
                     missing_val=int(st._missing_val),
                 )
                 if theta_e is not None:
@@ -790,11 +792,11 @@ class InfinitesimalREMLFitter:
                 st = op.streamer
                 scores = jnp.zeros((int(st.m), int(rhs_cols)), dtype=fp)
                 scores = op._accumulate_weighted_scores_from_xtv(scores, XtV, fp=fp)
-                from .smile_block_w import _zxm_impl_streamed
+                from .smile_block_w import _zxm_impl_streamed_from_scores
 
-                out = _zxm_impl_streamed(
+                out = _zxm_impl_streamed_from_scores(
                     st,
-                    op._scores_by_call(scores),
+                    scores,
                     missing_val=int(st._missing_val),
                 )
                 return out[:, 0] if squeeze else out

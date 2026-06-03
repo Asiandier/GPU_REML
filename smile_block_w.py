@@ -33,8 +33,11 @@ DiagMode = Literal["full", "mean"]
 _IDENTITY_TRACE_SCAN_TARGET_BYTES = 256 * 1024 * 1024
 _VALID_NORMALIZATIONS = ("kernel_trace", "effective_rank")
 _EFFECTIVE_RANK_KEYS = ("effective_rank", "retained_rank", "weight_rank", "rank")
-_W_DEVICE_CACHE_CAP_BYTES = 2 * 1024**3
-_W_DEVICE_CACHE_FRACTION = 0.10
+_W_DEVICE_CACHE_CAP_BYTES = 8 * 1024**3
+_W_DEVICE_CACHE_FRACTION = 0.35
+_W_BUCKET_WIDTH_MULTIPLE = 512
+_W_BUCKET_LOCAL_TARGET_BYTES = 4 * 1024**3
+_W_BUCKET_ASSUMED_RHS = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,6 +61,16 @@ class SmileBlockWeight:
         return int(self.start + self.size)
 
 
+@dataclasses.dataclass(frozen=True)
+class SmileBlockBucket:
+    """Padded device cache chunk for batched dense block multiplications."""
+
+    matrices: object
+    starts: object
+    sizes: object
+    width: int
+
+
 def default_w_device_cache_bytes(gpu_budget_bytes: float | None) -> float:
     """Return the default SMILE dense-W device cache limit."""
 
@@ -67,6 +80,54 @@ def default_w_device_cache_bytes(gpu_budget_bytes: float | None) -> float:
     if not np.isfinite(budget) or budget <= 0.0:
         return 0.0
     return float(min(_W_DEVICE_CACHE_CAP_BYTES, _W_DEVICE_CACHE_FRACTION * budget))
+
+
+def _bucket_width(width: int) -> int:
+    width = int(width)
+    multiple = int(_W_BUCKET_WIDTH_MULTIPLE)
+    return int(((width + multiple - 1) // multiple) * multiple)
+
+
+def estimate_bucketed_w_device_cache_bytes(
+    widths: Sequence[int],
+    cache_limit_bytes: float | None,
+) -> float:
+    """Return padded bucket-cache bytes if the W blocks fit the cache limit."""
+
+    limit = float(cache_limit_bytes or 0.0)
+    if limit <= 0.0:
+        return 0.0
+    padded = float(
+        sum(_bucket_width(int(width)) ** 2 * np.dtype(np.float32).itemsize for width in widths)
+    )
+    return padded if 0.0 < padded <= limit else 0.0
+
+
+def estimate_bucketed_w_local_workspace_bytes(
+    widths: Sequence[int],
+    *,
+    rhs_cols: int = _W_BUCKET_ASSUMED_RHS,
+    cache_enabled: bool,
+) -> float:
+    """Return a conservative local+output workspace estimate for W buckets."""
+
+    if not cache_enabled:
+        return 0.0
+    groups: dict[int, int] = {}
+    for width in widths:
+        bucket_width = _bucket_width(int(width))
+        groups[bucket_width] = groups.get(bucket_width, 0) + 1
+    max_local = 0.0
+    itemsize = np.dtype(np.float32).itemsize
+    for width, count in groups.items():
+        max_blocks = max(
+            1,
+            int(_W_BUCKET_LOCAL_TARGET_BYTES // (int(width) * int(rhs_cols) * itemsize)),
+        )
+        chunk_blocks = min(int(count), int(max_blocks))
+        local = float(chunk_blocks * int(width) * int(rhs_cols) * itemsize)
+        max_local = max(max_local, local)
+    return 2.0 * max_local
 
 
 def load_rds_matrix(path: str | os.PathLike[str]) -> np.ndarray:
@@ -253,6 +314,36 @@ def validate_weight_matrix(
 
 
 @jax.jit
+def _accumulate_weighted_scores_bucket_jit(
+    scores: jnp.ndarray,
+    XtV: jnp.ndarray,
+    W_bucket: jnp.ndarray,
+    starts: jnp.ndarray,
+    sizes: jnp.ndarray,
+    scale: jnp.ndarray,
+    normalizer: jnp.ndarray,
+) -> jnp.ndarray:
+    """Accumulate one padded bucket of block-diagonal W multiplications."""
+
+    width = W_bucket.shape[1]
+    rows = jnp.arange(width, dtype=starts.dtype)
+    mask = rows[None, :] < sizes[:, None]
+    idx = starts[:, None] + rows[None, :]
+    safe_idx = jnp.where(mask, idx, jnp.zeros((), dtype=idx.dtype))
+    local = XtV[safe_idx, :] * mask[:, :, None].astype(XtV.dtype)
+    weighted = jnp.matmul(
+        W_bucket.astype(XtV.dtype),
+        local,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    weighted = weighted * (scale / normalizer).astype(XtV.dtype)
+    weighted = weighted * mask[:, :, None].astype(XtV.dtype)
+    return scores.at[safe_idx.reshape(-1), :].add(
+        weighted.reshape((-1, XtV.shape[1]))
+    )
+
+
+@jax.jit
 def _zxm_one_call_jit(
     g_dev_packed,
     true_width,
@@ -274,46 +365,47 @@ def _zxm_one_call_jit(
     return acc + diff @ (inv_f[:, None] * b_f)
 
 
-def _zxm_impl_streamed(
+def _zxm_impl_streamed_from_scores(
     streamer,
-    b_by_call: jnp.ndarray,
+    scores: jnp.ndarray,
     *,
     missing_val: int,
 ) -> jnp.ndarray:
-    """Streaming matrix version of Z @ B using the streamer's packed cache."""
+    """Streaming Z @ scores without materializing a 3D call-layout array."""
 
-    if b_by_call.ndim != 3:
-        raise ValueError("b_by_call must have shape (n_calls, max_unpack_width, rhs).")
-    if b_by_call.shape[0] != int(streamer._n_calls):
-        raise ValueError(
-            f"b_by_call n_calls mismatch: expected {int(streamer._n_calls)}, "
-            f"got {int(b_by_call.shape[0])}."
-        )
-    if b_by_call.shape[1] != int(streamer._max_unpack_width):
-        raise ValueError(
-            f"b_by_call width mismatch: expected {int(streamer._max_unpack_width)}, "
-            f"got {int(b_by_call.shape[1])}."
-        )
+    if scores.ndim != 2:
+        raise ValueError("scores must have shape (m, rhs).")
+    if scores.shape[0] != int(streamer.m):
+        raise ValueError(f"scores row mismatch: expected m={int(streamer.m)}, got {scores.shape[0]}.")
 
     streamer._prepare_kv_pass()
-    fp = b_by_call.dtype
-    dev = next(iter(b_by_call.devices()))
+    fp = scores.dtype
+    dev = next(iter(scores.devices()))
     miss_u8 = jnp.asarray(np.uint8(missing_val), dtype=jnp.uint8)
-    acc = jnp.zeros((int(streamer.n), int(b_by_call.shape[2])), dtype=fp)
+    rhs = int(scores.shape[1])
+    acc = jnp.zeros((int(streamer.n), rhs), dtype=fp)
     if int(streamer._n_calls) == 0:
         return acc
 
+    pad = jnp.zeros((int(streamer._max_unpack_width), rhs), dtype=fp)
+    scores_pad = jnp.concatenate([scores, pad], axis=0)
     g_dev_next = _device_put_block(streamer._pop_cached(0), dev)
     for c in range(int(streamer._n_calls)):
         g_dev_cur = g_dev_next
         if c + 1 < int(streamer._n_calls):
             g_dev_next = _device_put_block(streamer._pop_cached(c + 1), dev)
+        start = int(streamer._call_snp_starts[c])
+        b_call = jax.lax.dynamic_slice(
+            scores_pad,
+            (start, 0),
+            (int(streamer._max_unpack_width), rhs),
+        )
         acc = _zxm_one_call_jit(
             g_dev_cur,
             streamer._true_widths_dev[c],
             streamer._means_by_call[c],
             streamer._inv_by_call[c],
-            b_by_call[c],
+            b_call,
             miss_u8,
             acc,
         )
@@ -356,14 +448,13 @@ class SmileBlockWeightedOperator:
         raw_diag = np.zeros((int(streamer.n),), dtype=np.float64) if diag_mode == "full" else None
         next_start = 0
         cache_limit = float(device_cache_max_bytes or 0.0)
-        raw_w_bytes = 0.0
+        raw_widths: list[int] = []
         for raw_W in weight_matrices:
             raw_shape = np.asarray(raw_W).shape
             if len(raw_shape) == 2:
-                raw_w_bytes += float(
-                    int(raw_shape[0]) * int(raw_shape[1]) * np.dtype(np.float32).itemsize
-                )
-        cache_w_on_device = bool(cache_limit > 0.0 and raw_w_bytes <= cache_limit)
+                raw_widths.append(int(raw_shape[0]))
+        bucket_cache_bytes = estimate_bucketed_w_device_cache_bytes(raw_widths, cache_limit)
+        cache_w_on_device = bucket_cache_bytes > 0.0
         for idx, raw_W in enumerate(weight_matrices):
             source = None if sources is None else sources[idx]
             W = validate_weight_matrix(
@@ -410,11 +501,6 @@ class SmileBlockWeightedOperator:
                     )
             if raw_diag is not None and diag_contrib is not None:
                 raw_diag += diag_contrib
-            W_dev = (
-                jax.device_put(jnp.asarray(W, dtype=jnp.float32), streamer.dev)
-                if cache_w_on_device
-                else None
-            )
             blocks.append(
                 SmileBlockWeight(
                     matrix=W,
@@ -422,7 +508,6 @@ class SmileBlockWeightedOperator:
                     size_value=int(W.shape[0]),
                     trace_per_sample=trace_per_sample,
                     source=source,
-                    device_matrix=W_dev,
                 )
             )
             next_start = stop
@@ -435,6 +520,11 @@ class SmileBlockWeightedOperator:
 
         self.streamer = streamer
         self.blocks = tuple(blocks)
+        self._w_device_buckets = (
+            self._build_w_device_buckets(self.blocks, streamer=streamer)
+            if cache_w_on_device
+            else ()
+        )
         self.normalization = normalization
         self.normalizer = self._compute_global_normalizer(
             [block.trace_per_sample for block in blocks],
@@ -447,7 +537,7 @@ class SmileBlockWeightedOperator:
         self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
         self.strict_coverage = bool(strict_coverage)
         self.diag_mode = diag_mode
-        self.w_device_cache_bytes = raw_w_bytes if cache_w_on_device else 0.0
+        self.w_device_cache_bytes = bucket_cache_bytes if cache_w_on_device else 0.0
 
     @classmethod
     def identity(
@@ -517,6 +607,7 @@ class SmileBlockWeightedOperator:
         self = cls.__new__(cls)
         self.streamer = streamer
         self.blocks = tuple(blocks)
+        self._w_device_buckets = ()
         self.normalization = normalization
         self.normalizer = cls._compute_global_normalizer(
             [block.trace_per_sample for block in blocks],
@@ -529,6 +620,7 @@ class SmileBlockWeightedOperator:
         self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
         self.strict_coverage = bool(strict_coverage)
         self.diag_mode = diag_mode
+        self.w_device_cache_bytes = 0.0
         return self
 
     @staticmethod
@@ -664,6 +756,49 @@ class SmileBlockWeightedOperator:
             raise ValueError(f"Invalid SMILE global normalizer: {value!r}.")
         return value
 
+    @staticmethod
+    def _build_w_device_buckets(
+        blocks: Sequence[SmileBlockWeight],
+        *,
+        streamer,
+    ) -> tuple[SmileBlockBucket, ...]:
+        groups: dict[int, list[SmileBlockWeight]] = {}
+        for block in blocks:
+            if block.is_identity or block.matrix is None:
+                continue
+            groups.setdefault(_bucket_width(block.size), []).append(block)
+
+        buckets: list[SmileBlockBucket] = []
+        itemsize = np.dtype(np.float32).itemsize
+        for width in sorted(groups):
+            group = groups[width]
+            max_blocks = max(
+                1,
+                int(
+                    _W_BUCKET_LOCAL_TARGET_BYTES
+                    // (int(width) * int(_W_BUCKET_ASSUMED_RHS) * itemsize)
+                ),
+            )
+            for chunk_start in range(0, len(group), max_blocks):
+                chunk = group[chunk_start : chunk_start + max_blocks]
+                W_host = np.zeros((len(chunk), width, width), dtype=np.float32)
+                starts = np.empty((len(chunk),), dtype=np.int32)
+                sizes = np.empty((len(chunk),), dtype=np.int32)
+                for idx, block in enumerate(chunk):
+                    size = int(block.size)
+                    W_host[idx, :size, :size] = np.asarray(block.matrix, dtype=np.float32)
+                    starts[idx] = int(block.start)
+                    sizes[idx] = size
+                buckets.append(
+                    SmileBlockBucket(
+                        matrices=jax.device_put(jnp.asarray(W_host), streamer.dev),
+                        starts=jax.device_put(jnp.asarray(starts), streamer.dev),
+                        sizes=jax.device_put(jnp.asarray(sizes), streamer.dev),
+                        width=int(width),
+                    )
+                )
+        return tuple(buckets)
+
     @property
     def n_blocks(self) -> int:
         return len(self.blocks)
@@ -687,6 +822,21 @@ class SmileBlockWeightedOperator:
         scale=1.0,
         block_idx: int | None = None,
     ) -> jnp.ndarray:
+        if block_idx is None and self._w_device_buckets:
+            scale_dev = jnp.asarray(scale, dtype=fp)
+            normalizer_dev = jnp.asarray(self.normalizer, dtype=fp)
+            for bucket in self._w_device_buckets:
+                scores = _accumulate_weighted_scores_bucket_jit(
+                    scores,
+                    XtV,
+                    bucket.matrices,
+                    bucket.starts,
+                    bucket.sizes,
+                    scale_dev,
+                    normalizer_dev,
+                )
+            return scores
+
         blocks = enumerate(self.blocks)
         scale_dev = jnp.asarray(scale, dtype=fp)
         normalizer_dev = jnp.asarray(self.normalizer, dtype=fp)
@@ -730,28 +880,14 @@ class SmileBlockWeightedOperator:
             block_idx=block_idx,
         )
 
-    def _scores_by_call(self, scores: jnp.ndarray) -> jnp.ndarray:
-        fp = scores.dtype
-        rhs = int(scores.shape[1])
-        b_by_call = jnp.zeros(
-            (int(self.streamer._n_calls), int(self.streamer._max_unpack_width), rhs),
-            dtype=fp,
-        )
-        for c in range(int(self.streamer._n_calls)):
-            start = int(self.streamer._call_snp_starts[c])
-            width = int(self.streamer._call_true_widths[c])
-            if width > 0:
-                b_by_call = b_by_call.at[c, :width, :].set(scores[start : start + width, :])
-        return b_by_call
-
     def kv(self, V: jnp.ndarray) -> jnp.ndarray:
         """Return ``sum_i Z_i W_i Z_i.T V / c`` for one genetic kernel."""
 
         squeeze = V.ndim == 1
         scores = self._weighted_scores(V)
-        out = _zxm_impl_streamed(
+        out = _zxm_impl_streamed_from_scores(
             self.streamer,
-            self._scores_by_call(scores),
+            scores,
             missing_val=int(self.streamer._missing_val),
         )
         return out[:, 0] if squeeze else out
@@ -763,9 +899,9 @@ class SmileBlockWeightedOperator:
             raise IndexError(f"block_idx={block_idx} out of range for {len(self.blocks)} blocks.")
         squeeze = V.ndim == 1
         scores = self._weighted_scores(V, block_idx=block_idx)
-        out = _zxm_impl_streamed(
+        out = _zxm_impl_streamed_from_scores(
             self.streamer,
-            self._scores_by_call(scores),
+            scores,
             missing_val=int(self.streamer._missing_val),
         )
         return out[:, 0] if squeeze else out
@@ -797,9 +933,9 @@ class SmileBlockWeightedOperator:
             V_work = V
         V_dev = jax.device_put(jnp.asarray(V_work), self.streamer.dev)
         scores = self._weighted_scores(V_dev)
-        out = _zxm_impl_streamed(
+        out = _zxm_impl_streamed_from_scores(
             self.streamer,
-            self._scores_by_call(scores),
+            scores,
             missing_val=int(self.streamer._missing_val),
         )
         out = jnp.asarray(theta_g_scalar, dtype=V_dev.dtype) * out
@@ -886,6 +1022,7 @@ class SmileMultiBlockWeightedOperator:
 
         operators: list[SmileBlockWeightedOperator] = []
         next_start = 0
+        remaining_cache_bytes = float(device_cache_max_bytes or 0.0)
         for group_idx, group in enumerate(groups):
             starts: list[int] = []
             for matrix in group:
@@ -917,8 +1054,12 @@ class SmileMultiBlockWeightedOperator:
                     start_offsets=starts,
                     effective_ranks=effective_ranks,
                     diag_mode=diag_mode,
-                    device_cache_max_bytes=device_cache_max_bytes,
+                    device_cache_max_bytes=remaining_cache_bytes,
                 )
+            )
+            remaining_cache_bytes = max(
+                0.0,
+                remaining_cache_bytes - float(operators[-1].w_device_cache_bytes),
             )
 
         if strict_coverage and next_start != int(streamer.m):
@@ -987,9 +1128,9 @@ class SmileMultiBlockWeightedOperator:
                 fp=fp,
                 scale=theta_g_arr[idx],
             )
-        out = _zxm_impl_streamed(
+        out = _zxm_impl_streamed_from_scores(
             self.streamer,
-            self.operators[0]._scores_by_call(scores),
+            scores,
             missing_val=int(self.streamer._missing_val),
         )
         if theta_e is not None:

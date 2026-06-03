@@ -174,11 +174,11 @@ def test_weighted_operator_can_cache_w_on_device():
             [W0, W1],
             normalization="kernel_trace",
             check_psd=True,
-            device_cache_max_bytes=1024 * 1024,
+            device_cache_max_bytes=16 * 1024 * 1024,
         )
 
         assert cached.w_device_cache_bytes > 0.0
-        assert all(block.device_matrix is not None for block in cached.blocks)
+        assert len(cached._w_device_buckets) > 0
         assert all(block.device_matrix is None for block in uncached.blocks)
         assert np.allclose(np.asarray(cached.kv(V)), np.asarray(uncached.kv(V)), atol=2e-4)
     finally:

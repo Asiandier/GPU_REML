@@ -9,7 +9,11 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .pipeline_common import run_planner
-from .smile_block_w import default_w_device_cache_bytes
+from .smile_block_w import (
+    default_w_device_cache_bytes,
+    estimate_bucketed_w_device_cache_bytes,
+    estimate_bucketed_w_local_workspace_bytes,
+)
 
 _GIB = 1024**3
 _F32 = 4
@@ -53,15 +57,21 @@ def estimate_smile_extra_live_bytes(
     xtv_scores_and_call_layout = 3.0 * _mat_bytes(total_p, rhs_cols)
     local_scores = _mat_bytes(max_w_block, rhs_cols)
     w_staging = float(_F32 * max_w_block * max_w_block)
-    total_w_bytes = float(
-        sum(_mat_bytes(int(width), int(width)) for width in (smile_w_block_sizes or ()))
+    w_device_cache = estimate_bucketed_w_device_cache_bytes(
+        tuple(int(width) for width in (smile_w_block_sizes or ())),
+        w_device_cache_limit,
     )
-    w_device_cache = (
-        total_w_bytes
-        if w_device_cache_limit > 0.0 and 0.0 < total_w_bytes <= float(w_device_cache_limit)
-        else 0.0
+    bucket_workspace = estimate_bucketed_w_local_workspace_bytes(
+        tuple(int(width) for width in (smile_w_block_sizes or ())),
+        cache_enabled=w_device_cache > 0.0,
     )
-    return xtv_scores_and_call_layout + local_scores + w_staging + w_device_cache
+    return (
+        xtv_scores_and_call_layout
+        + local_scores
+        + w_staging
+        + w_device_cache
+        + bucket_workspace
+    )
 
 
 def run_smile_planner(
@@ -104,6 +114,18 @@ def run_smile_planner(
         smile_w_block_sizes=smile_w_block_sizes,
         w_device_cache_limit=w_cache_limit,
     )
+    if base_budget is not None and reserve > 0.90 * float(base_budget):
+        w_cache_limit = 0.0
+        reserve = estimate_smile_extra_live_bytes(
+            total_p=total_p,
+            n_samples=n_samples,
+            n_grm=G,
+            n_covar=n_covar,
+            n_rand_vec=n_rand_vec,
+            slq_samples=slq_samples,
+            smile_w_block_sizes=smile_w_block_sizes,
+            w_device_cache_limit=w_cache_limit,
+        )
     adjusted_budget = (
         max(0.0, float(base_budget) - reserve)
         if base_budget is not None

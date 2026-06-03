@@ -342,20 +342,34 @@ partitioned, and sparse paths.
 
 This is why most tuning parameters control either memory movement
 (`--call-width`, `--gpu-budget-gib`, `--ring-depth`) or randomized numerical
-accuracy (`--n-rand-vec`, `--slq-samples`, `--slq-m`, `--pcg-tol`,
-`--precond-rank`).
+accuracy (`--n-rand-vec`, `--slq-samples`, `--slq-m`, `--slq-mode`).
 
-## Practical Guidance
+## Key Runtime Parameters
 
-- Use `--gpu-budget-gib` when sharing a GPU or when JAX memory preallocation is
-  undesirable.
-- For high-dimensional multi-GRM models, inspect boundary components and
-  convergence history rather than relying only on the final `h2`.
-- For SMILE-style weighted models, start with small `W_i` blocks and
-  `--no-w-psd-check` only when the supplied matrices are already known to be
-  symmetric positive semidefinite.
-- Treat sparse REML plus LASSO as an experimental workflow; use `--kkt-check`
-  when interpreting selected sparse effects.
+- `--gpu-budget-gib`: memory budget used by the planner when choosing streamed
+  genotype call width, ring depth, and projected-core size. If omitted, the
+  planner uses the current free GPU memory.
+- `--call-width`: number of SNPs decoded and multiplied per streamed genotype
+  call. The default `0` lets the planner choose this from the GPU memory model.
+- `--ring-depth`: number of host staging buffers used for genotype streaming.
+  The default `0` lets the planner choose it.
+- `--n-rand-vec`: number of Hutchinson random vectors used for REML trace terms.
+- `--slq-samples` and `--slq-m`: number of stochastic Lanczos probes and Lanczos
+  steps used for log-determinant estimation.
+- `--slq-mode`: log-determinant mode; `projected_core_residual` uses the
+  projected-core preconditioner inside SLQ.
+- `--precond-refresh-reldp`: projected-core refresh threshold after an accepted
+  REML step.
+- `--no-w-psd-check`: skips positive-semidefinite checks for SMILE `W_i` blocks.
+
+Sparse REML plus LASSO also exposes:
+
+- `--pcg-tol` and `--max-pcg-iters`: tolerance and iteration cap for block PCG
+  solves involving `V(theta)`.
+- `--screen-topk`, `--candidate-k`, and `--max-active`: screening, candidate
+  set, and active-set sizes for the LASSO stage.
+- `--lasso-n-lambda` and `--lasso-lam-min-ratio`: LASSO path length and minimum
+  lambda ratio.
 
 ## Validation
 

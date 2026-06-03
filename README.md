@@ -64,7 +64,7 @@ project. GPU_REML implements the part that matches its matrix-free REML engine:
 a block-diagonal SNP-space weight matrix `W`, evaluated without materializing
 the sample-space kernel:
 
-$$K_gV=\frac{\sum_iZ_{g,i}W_{g,i}Z_{g,i}^TV}{c_g},\quad c_g=\frac{\operatorname{tr}\left(\sum_iZ_{g,i}W_{g,i}Z_{g,i}^T\right)}{n}$$
+$$K_g=\frac{X_gW_gX_g^T}{c_g},\quad W_g=\operatorname{blockdiag}(W_{g,1},\ldots,W_{g,B}),\quad c_g=\frac{\operatorname{tr}(X_gW_gX_g^T)}{n}$$
 
 Each `W_{g,i}` is treated as an arbitrary dense block. Blocks inside one GRM are
 summed into one variance component; multiple GRM groups can be supplied when a

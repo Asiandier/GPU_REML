@@ -78,20 +78,27 @@ multi-component REML model is desired.
 
 ## Research Use Cases
 
-GPU_REML is a good fit when you want to:
+GPU_REML is most useful when the scientific question requires more than a
+single whole-genome GRM. It is designed to make multi-GRM REML practical by
+keeping each covariance component as a streamed genotype operator rather than a
+stored dense matrix. This is the main advantage of the project: users can expand
+from one GRM to many GRMs while keeping wall time low through GPU batched
+products and keeping CPU memory controlled by avoiding explicit `n x n` GRM
+storage.
 
-- estimate SNP heritability while avoiding explicit dense GRM construction;
-- compare one-GRM and multi-GRM REML fits on the same cohort;
-- decompose variance by chromosome, annotation, MAF bin, or custom SNP sets;
-- test genetic architecture hypotheses by changing the covariance
-  representation while holding phenotype, covariates, and sample filters fixed;
-- fit block-diagonal weighted-GRM models where dense `W_i` blocks encode local
-  SNP covariance or effect-correlation structure;
-- use the experimental sparse path for genotype settings where event-style
-  storage is computationally advantageous;
-- experiment with SLQ, Hutchinson, PCG, and preconditioning settings;
-- inspect component-level random effects, SNP effects, prediction outputs, and
-  convergence diagnostics after fitting.
+Typical use cases include:
+
+- comparing single-GRM and multi-GRM heritability estimates on the same cohort;
+- decomposing SNP heritability across chromosomes, LD environments, MAF bins,
+  annotations, or custom SNP sets;
+- fitting many covariance components without constructing and storing one dense
+  GRM per component;
+- benchmarking alternative covariance representations under matched phenotype,
+  covariate, and sample filters;
+- testing SMILE-style block-diagonal weighted GRMs where dense `W_i` blocks
+  encode local SNP covariance or effect-correlation structure;
+- inspecting convergence behavior, component variance estimates, and downstream
+  effect or prediction outputs from the fitted REML model.
 
 It is a poor fit when you need a complete genotype QC pipeline, binary-trait
 mixed models, turn-key cloud orchestration, or a polished production CLI with

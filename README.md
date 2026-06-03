@@ -9,13 +9,34 @@ estimation in linear mixed models where the genetic covariance is defined by one
 or more genomic relationship matrices (GRMs). These models are the standard
 language for estimating SNP heritability and asking how heritable signal is
 distributed across chromosomes, annotations, MAF bins, common and rare variants,
-or user-defined genomic regions. The computational obstacle is that the natural
-GRM representation is dense: constructing, storing, and repeatedly factorizing
-`n x n` kernels becomes the bottleneck as cohorts, marker counts, and component
-counts increase.
+or user-defined genomic regions.
 
-GPU_REML keeps the statistical model and changes the numerical representation.
-Each covariance component is represented as a matrix-free genotype operator:
+In the standard formulation, GPU_REML fits a continuous-trait linear mixed model
+
+```text
+y = X beta + u_1 + ... + u_G + e
+u_g ~ N(0, sigma_g^2 K_g)
+e   ~ N(0, sigma_e^2 I)
+```
+
+where each `K_g` is a genotype-defined covariance component. With components
+normalized to a comparable per-sample scale, SNP heritability is estimated from
+the fitted variance components, for example
+
+```text
+h2 = (sigma_1^2 + ... + sigma_G^2) /
+     (sigma_1^2 + ... + sigma_G^2 + sigma_e^2)
+```
+
+and the individual `sigma_g^2` terms describe how genetic variance is allocated
+across the chosen genomic components.
+
+The computational obstacle is that the natural GRM representation is dense:
+constructing, storing, and repeatedly factorizing `n x n` kernels becomes the
+bottleneck as cohorts, marker counts, and component counts increase. GPU_REML
+therefore keeps the statistical REML model but changes how each `K_g` is applied
+numerically. Instead of materializing a GRM, each covariance component is
+represented as a matrix-free genotype operator:
 
 ```text
 K_g V = Z_g (Z_g.T V) / m_eff,g

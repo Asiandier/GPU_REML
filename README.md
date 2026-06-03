@@ -68,24 +68,6 @@ Each `W_{g,i}` is treated as an arbitrary dense block. Blocks inside one GRM are
 summed into one variance component; multiple GRM groups can be supplied when a
 multi-component REML model is desired.
 
-## Scientific Problem
-
-Large genotype cohorts make it possible to study genetic architecture in more
-detail than a single genome-wide random effect. In practice, however, richer
-covariance models are still expensive to fit repeatedly. This limits routine
-comparison of questions such as:
-
-- How much SNP heritability is explained by different genomic regions,
-  annotations, LD environments, or MAF bins?
-- How do alternative GRM definitions change variance-component estimates,
-  random effects, SNP effects, or held-out prediction?
-- Can weighted SNP-space kernels be tested without constructing an explicit
-  dense sample-by-sample GRM?
-
-GPU_REML is built for this regime: repeated REML fitting and inspection of
-genotype-defined covariance models while keeping the genotype data in its native
-streamed matrix form.
-
 ## Core Ideas
 
 The framework is organized around a small number of design choices:

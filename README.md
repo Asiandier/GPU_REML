@@ -158,8 +158,7 @@ gpu-reml \
   --bed-prefix /path/to/data \
   --pheno-txt pheno.txt \
   --covar-txt covar.txt \
-  --out-prefix out/reml \
-  --verbose
+  --out-prefix out/reml
 ```
 
 PGEN input:

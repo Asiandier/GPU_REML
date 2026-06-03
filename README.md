@@ -96,13 +96,7 @@ Typical use cases include:
 - benchmarking alternative covariance representations under matched phenotype,
   covariate, and sample filters;
 - testing SMILE-style block-diagonal weighted GRMs where dense `W_i` blocks
-  encode local SNP covariance or effect-correlation structure;
-- inspecting convergence behavior, component variance estimates, and downstream
-  effect or prediction outputs from the fitted REML model.
-
-It is a poor fit when you need a complete genotype QC pipeline, binary-trait
-mixed models, turn-key cloud orchestration, or a polished production CLI with
-stable long-term output contracts.
+  encode local SNP covariance or effect-correlation structure.
 
 ## Installation
 

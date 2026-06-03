@@ -54,9 +54,7 @@ linear algebra.
 The goal is not only to produce one whole-genome heritability number. GPU_REML is
 designed as a method-development workbench for comparing covariance
 representations: **single-GRM models, multi-GRM models, and weighted kernels
-that encode local SNP covariance or effect-correlation structure**. The same
-fitted covariance model can then be reused for fixed effects, random effects,
-SNP effects, prediction, and related diagnostics.
+that encode local SNP covariance or effect-correlation structure**.
 
 The repository also includes a SMILE-inspired weighted-GRM path, with explicit
 attribution to the original [JianqiaoWang/SMILE](https://github.com/JianqiaoWang/SMILE)

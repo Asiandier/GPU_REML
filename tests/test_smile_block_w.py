@@ -184,6 +184,46 @@ def test_global_trace_normalization_sets_average_diagonal_to_one():
         st.close()
 
 
+def test_mean_diag_mode_keeps_exact_normalizer_but_returns_scalar_diag():
+    X = _make_non_degenerate_genotypes(n=18, m=7, seed=239)
+    rng = np.random.RandomState(240)
+    A0 = rng.standard_normal((3, 3))
+    A1 = rng.standard_normal((4, 4))
+    W0 = A0 @ A0.T + 0.1 * np.eye(3)
+    W1 = A1 @ A1.T + 0.1 * np.eye(4)
+
+    st = GenoBlockStreamer(
+        _ArraySource(X),
+        call_width=3,
+        component_block_sizes=[3, 4],
+        keep_host_stats=True,
+    )
+    try:
+        full = SmileBlockWeightedOperator(
+            st,
+            [W0, W1],
+            normalization="kernel_trace",
+            check_psd=True,
+            diag_mode="full",
+        )
+        mean = SmileBlockWeightedOperator(
+            st,
+            [W0, W1],
+            normalization="kernel_trace",
+            check_psd=True,
+            diag_mode="mean",
+        )
+        assert mean.normalizer == pytest.approx(full.normalizer, rel=1e-6)
+        assert np.asarray(mean.diag()).shape == ()
+        assert float(np.asarray(mean.diag())) == pytest.approx(
+            float(np.mean(np.asarray(full.diag()))), rel=2e-6, abs=2e-6
+        )
+        V = jnp.asarray(rng.standard_normal((X.shape[0], 2)).astype(np.float32))
+        assert np.allclose(np.asarray(mean.kv(V)), np.asarray(full.kv(V)), atol=3e-3, rtol=5e-4)
+    finally:
+        st.close()
+
+
 def test_weighted_hv_uses_single_genetic_variance_component():
     X = _make_non_degenerate_genotypes(n=20, m=7, seed=205)
     V = jnp.asarray(
@@ -333,8 +373,8 @@ def test_fitter_assembles_smile_single_kernel_reml_operator(monkeypatch):
         assert np.allclose(np.asarray(got_hv), np.asarray(ref_hv), atol=2e-3, rtol=3e-4)
 
         diag = np.asarray(diag_list[0])
-        assert diag.shape == (X.shape[0],)
-        assert float(np.sum(diag)) == pytest.approx(float(X.shape[0]), rel=2e-6, abs=2e-6)
+        assert diag.shape == ()
+        assert float(diag) == pytest.approx(1.0, rel=2e-6, abs=2e-6)
         return jnp.asarray([0.2, 0.8], dtype=jnp.float32), [{"iter": 1}]
 
     monkeypatch.setattr(f"{PKG.__name__}.reml_model.fit_reml", _fake_fit_reml)
@@ -401,7 +441,7 @@ def test_fitter_assembles_smile_multi_grm_groups(monkeypatch):
         fitter.close()
 
 
-def test_fitter_matrix_groups_use_precomputed_trace_metadata_for_normalizer(monkeypatch):
+def test_fitter_matrix_groups_compute_exact_trace_normalizer(monkeypatch):
     X = _make_non_degenerate_genotypes(n=18, m=7, seed=236)
     V = jnp.asarray(
         np.random.RandomState(237).standard_normal((X.shape[0], 2)).astype(np.float32)
@@ -424,7 +464,6 @@ def test_fitter_matrix_groups_use_precomputed_trace_metadata_for_normalizer(monk
     cfg = FitConfig(
         sources=[_ArraySource(X)],
         smile_weight_matrix_groups=[[np.eye(2), np.eye(2)], [np.eye(3)]],
-        smile_trace_per_sample_groups=[[10.0, 20.0], [40.0]],
         smile_normalization="kernel_trace",
         call_width=3,
         keep_host_stats=False,
@@ -433,7 +472,17 @@ def test_fitter_matrix_groups_use_precomputed_trace_metadata_for_normalizer(monk
     )
     fitter = InfinitesimalREMLFitter(cfg)
     try:
-        assert [op.normalizer for op in fitter._smile_operators] == pytest.approx([30.0, 40.0])
+        expected = []
+        st = fitter.streamers[0]
+        for op in fitter._smile_operators:
+            total = 0.0
+            for block in op.blocks:
+                idx = np.arange(block.start, block.stop, dtype=np.int64)
+                Z = np.asarray(st.extract_standardized_columns(idx), dtype=np.float32)
+                W = np.asarray(block.matrix, dtype=np.float32)
+                total += float(np.sum((Z @ W) * Z, dtype=np.float64) / X.shape[0])
+            expected.append(total)
+        assert [op.normalizer for op in fitter._smile_operators] == pytest.approx(expected, rel=1e-6)
         res = fitter.fit_infinitesimal(jnp.asarray(X[:, 0], dtype=jnp.float32))
         assert np.allclose(np.asarray(res.var_components), [0.2, 0.1, 0.7])
     finally:
@@ -456,15 +505,13 @@ def test_npy_weight_loader_uses_memmap_and_shape_metadata(tmp_path):
     assert SMILE.load_weight_matrix_shape(path) == (4, 4)
 
 
-def test_file_groups_use_sidecar_trace_metadata_for_normalizer(tmp_path):
+def test_file_groups_compute_exact_trace_normalizer(tmp_path):
     X = _make_non_degenerate_genotypes(n=18, m=5, seed=238)
     paths = []
     for idx, width in enumerate((2, 3)):
         path = tmp_path / f"W{idx}.npy"
         np.save(path, np.eye(width, dtype=np.float32))
-        path.with_suffix(".json").write_text(
-            json.dumps({"width": width, "kernel_trace_per_sample": float(width)}) + "\n"
-        )
+        path.with_suffix(".json").write_text(json.dumps({"width": width}) + "\n")
         paths.append(path)
 
     st = GenoBlockStreamer(
@@ -480,7 +527,7 @@ def test_file_groups_use_sidecar_trace_metadata_for_normalizer(tmp_path):
             check_psd=False,
         )
         assert multi.n_grm == 2
-        assert [op.normalizer for op in multi.operators] == pytest.approx([2.0, 3.0])
+        expected = []
         for op in multi.operators:
             ref_diag = np.zeros((X.shape[0],), dtype=np.float64)
             for block in op.blocks:
@@ -488,8 +535,10 @@ def test_file_groups_use_sidecar_trace_metadata_for_normalizer(tmp_path):
                 Z = np.asarray(st.extract_standardized_columns(idx), dtype=np.float32)
                 W = np.asarray(block.matrix, dtype=np.float32)
                 ref_diag += np.sum((Z @ W) * Z, axis=1, dtype=np.float64)
+            expected.append(float(np.sum(ref_diag) / X.shape[0]))
             ref_diag = ref_diag / float(op.normalizer)
             assert np.allclose(np.asarray(op.diag()), ref_diag, atol=2e-5, rtol=2e-5)
+        assert [op.normalizer for op in multi.operators] == pytest.approx(expected, rel=1e-6)
     finally:
         st.close()
 

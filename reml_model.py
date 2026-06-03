@@ -38,11 +38,10 @@ class FitConfig:
     smile_w_file_groups: Sequence[Sequence[str]] | None = None
     smile_weight_matrices: Sequence[np.ndarray] | None = None
     smile_weight_matrix_groups: Sequence[Sequence[np.ndarray]] | None = None
-    smile_trace_per_sample_values: Sequence[float | None] | None = None
-    smile_trace_per_sample_groups: Sequence[Sequence[float | None]] | None = None
     smile_identity: bool = False
     smile_identity_block_size: int | None = None
     smile_normalization: str = "kernel_trace"
+    smile_diag_mode: str = "mean"
     smile_check_psd: bool = True
     smile_strict_coverage: bool = True
     standardization_overrides: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
@@ -330,6 +329,10 @@ class InfinitesimalREMLFitter:
                 "Use only one SMILE W mode: identity, single W list, W file groups, "
                 "single matrix list, or matrix groups."
             )
+        if use_smile and cfg.smile_normalization != "kernel_trace":
+            raise ValueError("SMILE normalization must be 'kernel_trace'.")
+        if use_smile and cfg.smile_diag_mode not in ("full", "mean"):
+            raise ValueError("SMILE diag mode must be 'full' or 'mean'.")
         if use_smile and use_component_partition:
             raise ValueError("SMILE block-W mode cannot be combined with component partitioning.")
         if use_smile and (cfg.rare_sources is not None or cfg.rare_bed_prefix):
@@ -484,6 +487,7 @@ class InfinitesimalREMLFitter:
                         self.streamers[0],
                         block_size=cfg.smile_identity_block_size,
                         normalization=cfg.smile_normalization,
+                        diag_mode=cfg.smile_diag_mode,
                         strict_coverage=cfg.smile_strict_coverage,
                     ),
                 )
@@ -494,7 +498,7 @@ class InfinitesimalREMLFitter:
                     normalization=cfg.smile_normalization,
                     strict_coverage=cfg.smile_strict_coverage,
                     check_psd=cfg.smile_check_psd,
-                    trace_per_sample_groups=cfg.smile_trace_per_sample_groups,
+                    diag_mode=cfg.smile_diag_mode,
                 )
                 self._smile_operators = multi_op.operators
             elif cfg.smile_w_file_groups is not None:
@@ -504,6 +508,7 @@ class InfinitesimalREMLFitter:
                     normalization=cfg.smile_normalization,
                     strict_coverage=cfg.smile_strict_coverage,
                     check_psd=cfg.smile_check_psd,
+                    diag_mode=cfg.smile_diag_mode,
                 )
                 self._smile_operators = multi_op.operators
             elif cfg.smile_weight_matrices is not None:
@@ -514,7 +519,7 @@ class InfinitesimalREMLFitter:
                         normalization=cfg.smile_normalization,
                         strict_coverage=cfg.smile_strict_coverage,
                         check_psd=cfg.smile_check_psd,
-                        trace_per_sample_values=cfg.smile_trace_per_sample_values,
+                        diag_mode=cfg.smile_diag_mode,
                     ),
                 )
             else:
@@ -525,6 +530,7 @@ class InfinitesimalREMLFitter:
                         normalization=cfg.smile_normalization,
                         strict_coverage=cfg.smile_strict_coverage,
                         check_psd=cfg.smile_check_psd,
+                        diag_mode=cfg.smile_diag_mode,
                     ),
                 )
             self._smile_operator = self._smile_operators[0] if self._smile_operators else None

@@ -29,6 +29,7 @@ import numpy as np
 from .kv_impl import _device_put_block, _unpack_impute_center
 
 Normalization = Literal["kernel_trace"]
+DiagMode = Literal["full", "mean"]
 _IDENTITY_TRACE_SCAN_TARGET_BYTES = 256 * 1024 * 1024
 
 
@@ -156,28 +157,6 @@ def load_weight_matrix_shape(path: str | os.PathLike[str]) -> tuple[int, int]:
             data.close()
     matrix = load_weight_matrix(path)
     return tuple(int(x) for x in np.asarray(matrix).shape)
-
-
-def load_weight_kernel_trace_per_sample(path: str | os.PathLike[str]) -> float | None:
-    """Load an optional precomputed kernel trace normalizer from sidecar JSON."""
-
-    path = Path(path)
-    meta_path = path.with_suffix(".json")
-    if not meta_path.exists():
-        return None
-    try:
-        meta = json.loads(meta_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    for key in ("kernel_trace_per_sample", "trace_per_sample"):
-        if key in meta:
-            value = float(meta[key])
-            if not np.isfinite(value) or value <= 0.0:
-                raise ValueError(
-                    f"Invalid {key}={value!r} in SMILE W metadata {meta_path}."
-                )
-            return value
-    return None
 
 
 def _max_abs_symmetric_difference(W: np.ndarray, *, block_rows: int = 2048) -> float:
@@ -317,21 +296,21 @@ class SmileBlockWeightedOperator:
         check_psd: bool = True,
         sources: Sequence[str | None] | None = None,
         start_offsets: Sequence[int] | None = None,
-        trace_per_sample_values: Sequence[float | None] | None = None,
+        diag_mode: DiagMode = "full",
     ):
         if normalization != "kernel_trace":
             raise ValueError("normalization must be 'kernel_trace'.")
+        if diag_mode not in ("full", "mean"):
+            raise ValueError("diag_mode must be 'full' or 'mean'.")
         if not weight_matrices:
             raise ValueError("At least one weight matrix is required.")
         if sources is not None and len(sources) != len(weight_matrices):
             raise ValueError("sources length must match weight_matrices length.")
         if start_offsets is not None and len(start_offsets) != len(weight_matrices):
             raise ValueError("start_offsets length must match weight_matrices length.")
-        if trace_per_sample_values is not None and len(trace_per_sample_values) != len(weight_matrices):
-            raise ValueError("trace_per_sample_values length must match weight_matrices length.")
 
         blocks: list[SmileBlockWeight] = []
-        raw_diag = np.zeros((int(streamer.n),), dtype=np.float64)
+        raw_diag = np.zeros((int(streamer.n),), dtype=np.float64) if diag_mode == "full" else None
         next_start = 0
         for idx, raw_W in enumerate(weight_matrices):
             source = None if sources is None else sources[idx]
@@ -353,28 +332,21 @@ class SmileBlockWeightedOperator:
                 raise ValueError(
                     f"W[{idx}] with size {W.shape[0]} exceeds streamer.m={int(streamer.m)}."
                 )
-            precomputed_trace = (
-                None
-                if trace_per_sample_values is None
-                else trace_per_sample_values[idx]
-            )
-            diag_contrib = self._compute_diag_contribution(
-                streamer,
-                W,
-                start=start,
-            )
-            if normalization == "kernel_trace" and precomputed_trace is not None:
-                trace_per_sample = float(precomputed_trace)
-                if not np.isfinite(trace_per_sample) or trace_per_sample <= 0.0:
-                    raise ValueError(
-                        f"Invalid precomputed trace_per_sample for W[{idx}]: {trace_per_sample!r}."
-                    )
-            else:
+            if diag_mode == "full":
+                diag_contrib = self._compute_diag_contribution(streamer, W, start=start)
                 trace_per_sample = self._compute_trace_per_sample(
                     diag_contrib,
                     normalization=normalization,
                 )
-            raw_diag += diag_contrib
+            else:
+                diag_contrib = None
+                trace_per_sample = self._compute_trace_per_sample_from_block(
+                    streamer,
+                    W,
+                    start=start,
+                )
+            if raw_diag is not None and diag_contrib is not None:
+                raw_diag += diag_contrib
             blocks.append(
                 SmileBlockWeight(
                     matrix=W,
@@ -399,9 +371,13 @@ class SmileBlockWeightedOperator:
             [block.trace_per_sample for block in blocks],
             normalization=normalization,
         )
-        self._diag_host = np.asarray(raw_diag / float(self.normalizer), dtype=np.float32)
+        if raw_diag is None:
+            self._diag_host = np.asarray(1.0, dtype=np.float32)
+        else:
+            self._diag_host = np.asarray(raw_diag / float(self.normalizer), dtype=np.float32)
         self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
         self.strict_coverage = bool(strict_coverage)
+        self.diag_mode = diag_mode
 
     @classmethod
     def identity(
@@ -411,11 +387,14 @@ class SmileBlockWeightedOperator:
         block_size: int | None = None,
         normalization: Normalization = "kernel_trace",
         strict_coverage: bool = True,
+        diag_mode: DiagMode = "full",
     ) -> "SmileBlockWeightedOperator":
         """Create the SMILE operator for W=I without materializing I."""
 
         if normalization != "kernel_trace":
             raise ValueError("normalization must be 'kernel_trace'.")
+        if diag_mode not in ("full", "mean"):
+            raise ValueError("diag_mode must be 'full' or 'mean'.")
         if block_size is None:
             block_size = cls._auto_identity_block_size(streamer, normalization=normalization)
         block_size = int(block_size)
@@ -425,21 +404,29 @@ class SmileBlockWeightedOperator:
             raise ValueError("streamer must contain at least one SNP.")
 
         blocks: list[SmileBlockWeight] = []
-        raw_diag = np.zeros((int(streamer.n),), dtype=np.float64)
+        raw_diag = np.zeros((int(streamer.n),), dtype=np.float64) if diag_mode == "full" else None
         start = 0
         while start < int(streamer.m):
             size = min(block_size, int(streamer.m) - start)
-            diag_contrib = cls._compute_diag_contribution(
-                streamer,
-                None,
-                start=start,
-                size=size,
-            )
-            raw_diag += diag_contrib
-            trace_per_sample = cls._compute_trace_per_sample(
-                diag_contrib,
-                normalization=normalization,
-            )
+            if diag_mode == "full":
+                diag_contrib = cls._compute_diag_contribution(
+                    streamer,
+                    None,
+                    start=start,
+                    size=size,
+                )
+                raw_diag += diag_contrib
+                trace_per_sample = cls._compute_trace_per_sample(
+                    diag_contrib,
+                    normalization=normalization,
+                )
+            else:
+                trace_per_sample = cls._compute_trace_per_sample_from_block(
+                    streamer,
+                    None,
+                    start=start,
+                    size=size,
+                )
             blocks.append(
                 SmileBlockWeight(
                     matrix=None,
@@ -460,9 +447,13 @@ class SmileBlockWeightedOperator:
             [block.trace_per_sample for block in blocks],
             normalization=normalization,
         )
-        self._diag_host = np.asarray(raw_diag / float(self.normalizer), dtype=np.float32)
+        if raw_diag is None:
+            self._diag_host = np.asarray(1.0, dtype=np.float32)
+        else:
+            self._diag_host = np.asarray(raw_diag / float(self.normalizer), dtype=np.float32)
         self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
         self.strict_coverage = bool(strict_coverage)
+        self.diag_mode = diag_mode
         return self
 
     @staticmethod
@@ -485,12 +476,10 @@ class SmileBlockWeightedOperator:
         **kwargs,
     ) -> "SmileBlockWeightedOperator":
         matrices = [load_weight_matrix(path) for path in paths]
-        trace_values = [load_weight_kernel_trace_per_sample(path) for path in paths]
         return cls(
             streamer,
             matrices,
             sources=[os.fspath(path) for path in paths],
-            trace_per_sample_values=trace_values,
             **kwargs,
         )
 
@@ -530,6 +519,32 @@ class SmileBlockWeightedOperator:
         return value
 
     @staticmethod
+    def _compute_trace_per_sample_from_block(
+        streamer,
+        W: np.ndarray | None,
+        *,
+        start: int,
+        size: int | None = None,
+    ) -> float:
+        width = int(size if W is None else W.shape[0])
+        idx = np.arange(int(start), int(start + width), dtype=np.int64)
+        Z = np.asarray(streamer.extract_standardized_columns(idx), dtype=np.float32, order="C")
+        if W is None:
+            value = float(np.sum(Z * Z, dtype=np.float64) / float(streamer.n))
+        else:
+            dev = streamer.dev
+            Z_dev = jax.device_put(jnp.asarray(Z, dtype=jnp.float32), dev)
+            W_dev = jax.device_put(jnp.asarray(W, dtype=jnp.float32), dev)
+            weighted_dev = jnp.matmul(Z_dev, W_dev, precision=jax.lax.Precision.HIGHEST)
+            diag_dev = jnp.sum(weighted_dev * Z_dev, axis=1)
+            diag = np.asarray(jax.device_get(diag_dev), dtype=np.float64)
+            value = float(np.sum(diag) / float(streamer.n))
+            del Z_dev, W_dev, weighted_dev, diag_dev
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Invalid SMILE block trace contribution: {value!r}.")
+        return value
+
+    @staticmethod
     def _compute_global_normalizer(
         trace_values: Sequence[float],
         *,
@@ -545,7 +560,12 @@ class SmileBlockWeightedOperator:
         return len(self.blocks)
 
     def diag(self) -> jnp.ndarray:
-        """Return ``diag(Z W Z.T / c)`` without forming the dense kernel."""
+        """Return kernel diagonal information without forming the dense kernel.
+
+        ``diag_mode="full"`` returns the per-sample diagonal.  ``diag_mode="mean"``
+        returns the scalar average diagonal, which is one under kernel-trace
+        normalization and is sufficient for the scalar-identity preconditioner.
+        """
 
         return self._diag_dev
 
@@ -731,15 +751,13 @@ class SmileMultiBlockWeightedOperator:
         symmetrize: bool = True,
         check_psd: bool = True,
         source_groups: Sequence[Sequence[str | None]] | None = None,
-        trace_per_sample_groups: Sequence[Sequence[float | None]] | None = None,
+        diag_mode: DiagMode = "full",
     ) -> "SmileMultiBlockWeightedOperator":
         groups = [list(group) for group in weight_matrix_groups]
         if not groups or any(len(group) == 0 for group in groups):
             raise ValueError("SMILE GRM groups must be non-empty.")
         if source_groups is not None and len(source_groups) != len(groups):
             raise ValueError("source_groups length must match weight_matrix_groups length.")
-        if trace_per_sample_groups is not None and len(trace_per_sample_groups) != len(groups):
-            raise ValueError("trace_per_sample_groups length must match weight_matrix_groups length.")
 
         operators: list[SmileBlockWeightedOperator] = []
         next_start = 0
@@ -755,11 +773,6 @@ class SmileMultiBlockWeightedOperator:
                 next_start += int(W_arr.shape[0])
 
             sources = None if source_groups is None else list(source_groups[group_idx])
-            trace_values = (
-                None
-                if trace_per_sample_groups is None
-                else list(trace_per_sample_groups[group_idx])
-            )
             operators.append(
                 SmileBlockWeightedOperator(
                     streamer,
@@ -770,7 +783,7 @@ class SmileMultiBlockWeightedOperator:
                     check_psd=check_psd,
                     sources=sources,
                     start_offsets=starts,
-                    trace_per_sample_values=trace_values,
+                    diag_mode=diag_mode,
                 )
             )
 
@@ -790,15 +803,10 @@ class SmileMultiBlockWeightedOperator:
     ) -> "SmileMultiBlockWeightedOperator":
         matrix_groups = [[load_weight_matrix(path) for path in group] for group in path_groups]
         source_groups = [[os.fspath(path) for path in group] for group in path_groups]
-        trace_groups = [
-            [load_weight_kernel_trace_per_sample(path) for path in group]
-            for group in path_groups
-        ]
         return cls.from_weight_matrix_groups(
             streamer,
             matrix_groups,
             source_groups=source_groups,
-            trace_per_sample_groups=trace_groups,
             **kwargs,
         )
 

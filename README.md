@@ -1,34 +1,45 @@
 # GPU_REML
 
-Matrix-free GPU REML for genotype-defined variance components.
+GPU_REML is a GPU-accelerated statistical framework for SNP heritability
+estimation, genetic-variance decomposition, and downstream mixed-model
+inference at biobank scale.
 
-GPU_REML is a research toolkit for estimating SNP heritability and
-variance-component models from large genotype cohorts. It targets a specific
-pain point in genomic REML: the statistical model is naturally written in terms
-of one or more genomic relationship matrices (GRMs), but explicitly building
-and factorizing dense `n x n` GRMs becomes the bottleneck as cohorts grow.
+The central statistical problem is restricted maximum likelihood (REML)
+estimation in linear mixed models where the genetic covariance is defined by one
+or more genomic relationship matrices (GRMs). These models are the standard
+language for estimating SNP heritability and asking how heritable signal is
+distributed across chromosomes, annotations, MAF bins, common and rare variants,
+or user-defined genomic regions. The computational obstacle is that the natural
+GRM representation is dense: constructing, storing, and repeatedly factorizing
+`n x n` kernels becomes the bottleneck as cohorts, marker counts, and component
+counts increase.
 
-GPU_REML keeps the REML model, but changes the computation. Each GRM is
-represented by streamed genotype matrix products:
+GPU_REML keeps the statistical model and changes the numerical representation.
+Each covariance component is represented as a matrix-free genotype operator:
 
 ```text
 K_g V = Z_g (Z_g.T V) / m_eff,g
 ```
 
-where genotype blocks are decoded on the host, streamed to the accelerator, and
-multiplied in batches. The REML solver then uses block PCG, stochastic trace and
-log-determinant estimates, and a projected-core preconditioner instead of dense
-linear algebra on an explicit GRM.
+Genotype blocks are decoded on the host, streamed to the accelerator, and
+multiplied in GPU batches. REML evaluation is then built from block PCG solves,
+Hutchinson trace estimates, SLQ log-determinant estimates, constrained
+AI/Fisher updates, and projected-core preconditioning rather than dense GRM
+linear algebra.
 
-The result is a Python/JAX codebase for experiments where the object of
-interest is not only a single SNP-heritability number, but a flexible variance
-decomposition across chromosomes, annotations, MAF bins, common/rare variant
-sets, or custom SNP partitions.
+The goal is not only to produce one whole-genome heritability number. GPU_REML is
+designed as a method-development workbench for comparing covariance
+representations: single-GRM, multi-GRM, partitioned common-variant models,
+common-plus-rare models, and weighted kernels that encode local SNP covariance
+or effect-correlation structure. The same fitted covariance model can then be
+reused for fixed effects, random effects, SNP effects, prediction, and related
+diagnostics.
 
-The current development branch also includes a SMILE-inspired weighted-GRM path.
-It follows the idea of introducing a SNP-by-SNP weight matrix `W` into the
-genotype covariance, while adapting it to GPU_REML's matrix-free REML solver. In
-this repository the implemented form is deliberately block diagonal:
+The repository also includes a SMILE-inspired weighted-GRM path, with explicit
+attribution to the original [JianqiaoWang/SMILE](https://github.com/JianqiaoWang/SMILE)
+project. GPU_REML implements the part that matches its matrix-free REML engine:
+a block-diagonal SNP-space weight matrix `W`, evaluated without materializing
+the sample-space kernel:
 
 ```text
 K_g V = (sum_i Z_{g,i} W_{g,i} Z_{g,i}.T V) / c_g
@@ -39,14 +50,28 @@ Each `W_{g,i}` is treated as an arbitrary dense block. Blocks inside one GRM are
 summed into one variance component; multiple GRM groups can be supplied when a
 multi-component REML model is desired.
 
-## Why This Project Exists
+## Scientific Problem
 
-Many genomics tools are excellent at association testing, QC, or fixed sets of
-mixed-model workflows. GPU_REML is narrower: it is built for researchers who
-want to fit and inspect REML variance-component models while keeping the
-genotype data in its native matrix form.
+Large genotype cohorts make it possible to study genetic architecture in more
+detail than a single genome-wide random effect. In practice, however, richer
+covariance models are still expensive to fit repeatedly. This limits routine
+comparison of questions such as:
 
-The design priorities are:
+- How much SNP heritability is explained by different genomic regions,
+  annotations, LD environments, or MAF bins?
+- Do common and rare variants require separate covariance representations?
+- How do alternative GRM definitions change variance-component estimates,
+  random effects, SNP effects, or held-out prediction?
+- Can weighted SNP-space kernels be tested without constructing an explicit
+  dense sample-by-sample GRM?
+
+GPU_REML is built for this regime: repeated REML fitting and inspection of
+genotype-defined covariance models while keeping the genotype data in its native
+streamed matrix form.
+
+## Core Ideas
+
+The framework is organized around a small number of design choices:
 
 - **Matrix-free REML.** GRMs are operators, not stored dense matrices.
 - **GPU-oriented streaming.** BED/PGEN genotype blocks are packed on the CPU
@@ -54,13 +79,18 @@ The design priorities are:
 - **Flexible variance decomposition.** A model can use one GRM, several input
   GRMs, contiguous SNP blocks, or arbitrary SNP-index components from a single
   genotype file.
+- **Common and rare variant support.** Dense common-variant streams and sparse
+  rare-variant event streams can be combined in one mixed-model covariance.
 - **Block-diagonal weighted kernels.** The SMILE path supports weighted
   covariance terms of the form `sum_i Z_i W_i Z_i.T`, evaluated without forming
-  an `n x n` kernel.
+  an `n x n` kernel and normalized by the exact genotype-stream trace.
 - **Numerical scalability.** PCG solves, Hutchinson traces, SLQ log-determinants,
   and low-rank projected-core preconditioning are exposed as first-class
   algorithmic controls.
-- **Research visibility.** The repository exposes intermediate choices,
+- **End-to-end inference.** Fitted covariance models can be reused for fixed
+  effects, random effects, SNP effects, prediction, GWAS utilities, and sparse
+  REML/LASSO experiments.
+- **Research transparency.** The repository exposes intermediate choices,
   convergence behavior, component metadata, effect estimates, prediction paths,
   and sparse-model diagnostics instead of hiding the fit behind a black box.
 
@@ -70,7 +100,7 @@ tools for standard production workflows, and use GPU_REML when the question is
 "how should this genotype-defined covariance be represented, partitioned,
 preconditioned, and estimated at scale?"
 
-## Model
+## Statistical Model
 
 GPU_REML fits Gaussian linear mixed models with genotype-defined covariance
 components:
@@ -83,6 +113,11 @@ e   ~ N(0, theta_e I)
 K_g = Z_g Z_g.T / m_eff,g
 H(theta) = sum_g theta_g K_g + theta_e I
 ```
+
+The REML objective is evaluated without explicitly forming `K_g`, `H^-1`, or the
+REML projection matrix. Component operators supply the products needed by the
+score equations, average-information updates, log-determinant estimator, and
+preconditioner.
 
 The public API and command-line tools support:
 
@@ -98,18 +133,21 @@ The public API and command-line tools support:
 See [docs/mathematical_overview.md](docs/mathematical_overview.md) for the REML
 objective, score equations, randomized estimators, and preconditioner structure.
 
-## When To Use It
+## Research Use Cases
 
 GPU_REML is a good fit when you want to:
 
-- estimate SNP heritability without materializing a dense GRM;
+- estimate SNP heritability while avoiding explicit dense GRM construction;
 - compare one-GRM and multi-GRM REML fits on the same cohort;
 - decompose variance by chromosome, annotation, MAF bin, or custom SNP sets;
+- test genetic architecture hypotheses by changing the covariance
+  representation while holding phenotype, covariates, and sample filters fixed;
 - fit block-diagonal weighted-GRM models where dense `W_i` blocks encode local
   SNP covariance or effect-correlation structure;
 - combine dense common-variant covariance with sparse rare-variant components;
 - experiment with SLQ, Hutchinson, PCG, and preconditioning settings;
-- inspect component-level random effects or SNP effects after fitting.
+- inspect component-level random effects, SNP effects, prediction outputs, and
+  convergence diagnostics after fitting.
 
 It is a poor fit when you need a complete genotype QC pipeline, binary-trait
 mixed models, turn-key cloud orchestration, or a polished production CLI with

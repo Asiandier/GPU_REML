@@ -8,8 +8,8 @@ The central statistical problem is restricted maximum likelihood (REML)
 estimation in linear mixed models where the genetic covariance is defined by one
 or more genomic relationship matrices (GRMs). These models are the standard
 language for estimating SNP heritability and asking how heritable signal is
-distributed across chromosomes, annotations, MAF bins, common and rare variants,
-or user-defined genomic regions.
+distributed across chromosomes, annotations, MAF bins, LD environments, or
+user-defined genomic regions.
 
 In the standard formulation, GPU_REML fits a continuous-trait linear mixed model
 
@@ -50,10 +50,10 @@ linear algebra.
 
 The goal is not only to produce one whole-genome heritability number. GPU_REML is
 designed as a method-development workbench for comparing covariance
-representations: single-GRM, multi-GRM, partitioned common-variant models,
-common-plus-rare models, and weighted kernels that encode local SNP covariance
-or effect-correlation structure. The same fitted covariance model can then be
-reused for fixed effects, random effects, SNP effects, prediction, and related
+representations: single-GRM models, multi-GRM models, partitioned SNP-set
+models, and weighted kernels that encode local SNP covariance or
+effect-correlation structure. The same fitted covariance model can then be reused
+for fixed effects, random effects, SNP effects, prediction, and related
 diagnostics.
 
 The repository also includes a SMILE-inspired weighted-GRM path, with explicit
@@ -80,7 +80,6 @@ comparison of questions such as:
 
 - How much SNP heritability is explained by different genomic regions,
   annotations, LD environments, or MAF bins?
-- Do common and rare variants require separate covariance representations?
 - How do alternative GRM definitions change variance-component estimates,
   random effects, SNP effects, or held-out prediction?
 - Can weighted SNP-space kernels be tested without constructing an explicit
@@ -96,15 +95,16 @@ The framework is organized around a small number of design choices:
 
 - **Matrix-free REML.** GRMs are operators, not stored dense matrices.
 - **GPU-oriented streaming.** BED/PGEN genotype blocks are packed on the CPU
-  and multiplied on the accelerator with tunable call width and memory budget.
+  and multiplied on the GPU with tunable call width and memory budget.
 - **Flexible variance decomposition.** A model can use one GRM, several input
   GRMs, contiguous SNP blocks, or arbitrary SNP-index components from a single
   genotype file.
-- **Common and rare variant support.** Dense common-variant streams and sparse
-  rare-variant event streams can be combined in one mixed-model covariance.
 - **Block-diagonal weighted kernels.** The SMILE path supports weighted
   covariance terms of the form `sum_i Z_i W_i Z_i.T`, evaluated without forming
   an `n x n` kernel and normalized by the exact genotype-stream trace.
+- **Sparse acceleration path.** Experimental sparse genotype streams are
+  available for workflows where event-style storage is more efficient than dense
+  genotype blocks.
 - **Numerical scalability.** PCG solves, Hutchinson traces, SLQ log-determinants,
   and low-rank projected-core preconditioning are exposed as first-class
   algorithmic controls.
@@ -146,7 +146,7 @@ The public API and command-line tools support:
 - partitioned heritability from one genotype file;
 - SMILE-style block-diagonal weighted GRMs;
 - PLINK1 BED/BIM/FAM and PLINK2 PGEN/PVAR/PSAM inputs;
-- common-variant dense streams and sparse rare-variant streams;
+- dense genotype streams and experimental sparse genotype streams;
 - post-REML fixed, random, SNP-effect, and prediction outputs;
 - continuous-trait marginal GWAS utilities;
 - sparse REML plus weighted LASSO with global KKT checks.
@@ -165,7 +165,8 @@ GPU_REML is a good fit when you want to:
   representation while holding phenotype, covariates, and sample filters fixed;
 - fit block-diagonal weighted-GRM models where dense `W_i` blocks encode local
   SNP covariance or effect-correlation structure;
-- combine dense common-variant covariance with sparse rare-variant components;
+- use the experimental sparse path for genotype settings where event-style
+  storage is computationally advantageous;
 - experiment with SLQ, Hutchinson, PCG, and preconditioning settings;
 - inspect component-level random effects, SNP effects, prediction outputs, and
   convergence diagnostics after fitting.

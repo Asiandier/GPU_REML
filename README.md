@@ -42,7 +42,7 @@ numerically. Instead of materializing a GRM, each covariance component is
 represented as a matrix-free genotype operator:
 
 $$
-K_g V = \frac{Z_g (Z_g^T V)}{m_{\mathrm{eff},g}}
+K_g v = \frac{Z_g (Z_g^T v)}{m_{\mathrm{eff},g}}
 $$
 
 Genotype blocks are decoded on the host, streamed to the GPU, and multiplied in

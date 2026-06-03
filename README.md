@@ -25,6 +25,20 @@ interest is not only a single SNP-heritability number, but a flexible variance
 decomposition across chromosomes, annotations, MAF bins, common/rare variant
 sets, or custom SNP partitions.
 
+The current development branch also includes a SMILE-inspired weighted-GRM path.
+It follows the idea of introducing a SNP-by-SNP weight matrix `W` into the
+genotype covariance, while adapting it to GPU_REML's matrix-free REML solver. In
+this repository the implemented form is deliberately block diagonal:
+
+```text
+K_g V = (sum_i Z_{g,i} W_{g,i} Z_{g,i}.T V) / c_g
+c_g   = tr(sum_i Z_{g,i} W_{g,i} Z_{g,i}.T) / n
+```
+
+Each `W_{g,i}` is treated as an arbitrary dense block. Blocks inside one GRM are
+summed into one variance component; multiple GRM groups can be supplied when a
+multi-component REML model is desired.
+
 ## Why This Project Exists
 
 Many genomics tools are excellent at association testing, QC, or fixed sets of
@@ -40,6 +54,9 @@ The design priorities are:
 - **Flexible variance decomposition.** A model can use one GRM, several input
   GRMs, contiguous SNP blocks, or arbitrary SNP-index components from a single
   genotype file.
+- **Block-diagonal weighted kernels.** The SMILE path supports weighted
+  covariance terms of the form `sum_i Z_i W_i Z_i.T`, evaluated without forming
+  an `n x n` kernel.
 - **Numerical scalability.** PCG solves, Hutchinson traces, SLQ log-determinants,
   and low-rank projected-core preconditioning are exposed as first-class
   algorithmic controls.
@@ -71,6 +88,7 @@ The public API and command-line tools support:
 
 - single-GRM and multi-GRM REML;
 - partitioned heritability from one genotype file;
+- SMILE-style block-diagonal weighted GRMs;
 - PLINK1 BED/BIM/FAM and PLINK2 PGEN/PVAR/PSAM inputs;
 - common-variant dense streams and sparse rare-variant streams;
 - post-REML fixed, random, SNP-effect, and prediction outputs;
@@ -87,6 +105,8 @@ GPU_REML is a good fit when you want to:
 - estimate SNP heritability without materializing a dense GRM;
 - compare one-GRM and multi-GRM REML fits on the same cohort;
 - decompose variance by chromosome, annotation, MAF bin, or custom SNP sets;
+- fit block-diagonal weighted-GRM models where dense `W_i` blocks encode local
+  SNP covariance or effect-correlation structure;
 - combine dense common-variant covariance with sparse rare-variant components;
 - experiment with SLQ, Hutchinson, PCG, and preconditioning settings;
 - inspect component-level random effects or SNP effects after fitting.
@@ -162,6 +182,32 @@ gpu-reml \
   --out-prefix out/partitioned
 ```
 
+SMILE-style block-diagonal weighted GRM:
+
+```bash
+gpu-reml \
+  --smile \
+  --bed-prefix /path/to/data \
+  --w-files W_block_1.npy,W_block_2.npy,W_block_3.npy \
+  --pheno-txt pheno.txt \
+  --covar-txt covar.txt \
+  --out-prefix out/smile
+```
+
+Multiple weighted GRMs are supplied as semicolon-separated groups. Blocks within
+a group are summed into one GRM, and each group receives its own variance
+component:
+
+```bash
+gpu-reml \
+  --smile \
+  --bed-prefix /path/to/data \
+  --grm-groups 'A_1.npy,A_2.npy;B_1.npy,B_2.npy' \
+  --pheno-txt pheno.txt \
+  --covar-txt covar.txt \
+  --out-prefix out/smile_multi
+```
+
 Sparse REML plus LASSO:
 
 ```bash
@@ -211,6 +257,50 @@ name components and carry metadata:
 
 NPZ specs are also supported for compact programmatic construction. See
 [docs/component_specs.md](docs/component_specs.md).
+
+## SMILE-Style Weighted GRMs
+
+The SMILE-related path is inspired by the original
+[JianqiaoWang/SMILE](https://github.com/JianqiaoWang/SMILE) R project. The
+original repository provides SMILE estimation routines and a genetic application
+interface using genotype data with a specified weight matrix `W` or block
+division.
+
+GPU_REML does not vendor or reimplement the full R package. Instead, it
+implements the part that fits naturally into GPU_REML's operator-based REML
+architecture: a matrix-free weighted kernel with block-diagonal `W`.
+
+For one weighted GRM, the model component is:
+
+```text
+K V = (Z_1 W_1 Z_1.T V + ... + Z_B W_B Z_B.T V) / c
+c   = tr(Z_1 W_1 Z_1.T + ... + Z_B W_B Z_B.T) / n
+```
+
+The normalization is computed exactly for the current genotype stream,
+standardization, and sample filter. It is not approximated by `tr(W)` and does
+not require precomputed trace metadata. The implementation never materializes
+the `n x n` kernel; it streams genotype products, applies each dense `W_i` in
+SNP space, and then streams the result back through `Z_i`.
+
+For multi-GRM SMILE models, `--grm-groups` defines the grouping:
+
+```text
+--grm-groups 'W_1,W_2;W_3,W_4,W_5'
+```
+
+This creates two variance components:
+
+```text
+K_1 = (Z_1 W_1 Z_1.T + Z_2 W_2 Z_2.T) / c_1
+K_2 = (Z_3 W_3 Z_3.T + Z_4 W_4 Z_4.T + Z_5 W_5 Z_5.T) / c_2
+```
+
+This path is intended for method development around local LD, block-wise
+effect-correlation models, and weighted covariance structures. Large dense
+`W_i` blocks are computationally expensive: exact trace initialization and each
+`W_i @ (Z_i.T V)` operation scale with the block width, so practical block sizes
+should be chosen with GPU memory and runtime in mind.
 
 ## Outputs
 
@@ -280,6 +370,11 @@ evaluation then combines:
 - a projected-core preconditioner `dI + U C(theta) U.T` that captures leading
   covariance structure and can also support residual SLQ.
 
+For SMILE-style weighted kernels, the same REML loop is reused after replacing
+the standard GRM operator by the block-diagonal weighted operator. This keeps the
+new covariance representation isolated from the ordinary single-GRM, multi-GRM,
+partitioned, and sparse paths.
+
 This is why most tuning parameters control either memory movement
 (`--call-width`, `--gpu-budget-gib`, `--ring-depth`) or randomized numerical
 accuracy (`--n-rand-vec`, `--slq-samples`, `--slq-m`, `--pcg-tol`,
@@ -295,6 +390,9 @@ accuracy (`--n-rand-vec`, `--slq-samples`, `--slq-m`, `--pcg-tol`,
   when comparing against GCTA, BOLT-REML, or other REML software.
 - For high-dimensional multi-GRM models, inspect boundary components and
   convergence history rather than relying only on the final `h2`.
+- For SMILE-style weighted models, start with small `W_i` blocks and
+  `--no-w-psd-check` only when the supplied matrices are already known to be
+  symmetric positive semidefinite.
 - Treat sparse REML plus LASSO as an experimental workflow; use `--kkt-check`
   when interpreting selected sparse effects.
 
@@ -314,8 +412,8 @@ python -m pip wheel --no-deps --no-build-isolation \
 ```
 
 The repository includes tests for REML updates, PCG/preconditioning, genotype
-streaming, PGEN/BED sources, partitioned GRMs, sparse streams, effect
-estimation, prediction, GWAS, CLI behavior, and packaging.
+streaming, PGEN/BED sources, partitioned GRMs, SMILE-style weighted GRMs, sparse
+streams, effect estimation, prediction, GWAS, CLI behavior, and packaging.
 
 Large local genotype fixtures under `tests/data/` are intentionally not included
 in the public repository. Tests that require those fixtures are skipped when the
@@ -333,4 +431,3 @@ files are absent.
   conclusions.
 - No public license has been selected yet. Do not redistribute until the project
   owner adds an explicit license.
-

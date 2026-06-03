@@ -22,6 +22,60 @@ The implementation never needs to materialize `K_g`; it only needs the product:
 K_g V = Z_g (Z_g^T V) / m_eff,g
 ```
 
+## SMILE-Style Weighted Kernels
+
+GPU_REML also includes a SMILE-inspired weighted kernel path. The implementation
+is inspired by the original
+[JianqiaoWang/SMILE](https://github.com/JianqiaoWang/SMILE) R project, but the
+form implemented here is specialized to GPU_REML's matrix-free REML engine.
+
+For one weighted GRM, `W` is represented as a block diagonal matrix:
+
+```text
+W = blockdiag(W_1, ..., W_B)
+```
+
+with corresponding contiguous genotype blocks:
+
+```text
+Z = [Z_1, ..., Z_B]
+```
+
+The genetic covariance component is:
+
+```text
+K = (sum_i Z_i W_i Z_i^T) / c
+```
+
+where the normalizer is computed from the current standardized genotype stream:
+
+```text
+c = tr(sum_i Z_i W_i Z_i^T) / n
+  = (1/n) sum_i tr(Z_i W_i Z_i^T)
+```
+
+This gives:
+
+```text
+tr(K) = n
+```
+
+The computation never forms the `n x n` matrix. For any right-hand side `V`:
+
+```text
+K V = (sum_i Z_i [W_i (Z_i^T V)]) / c
+```
+
+Blocks within one SMILE GRM are computational terms inside one variance
+component. Multiple SMILE GRMs are represented as groups of blocks:
+
+```text
+K_g = (sum_i Z_{g,i} W_{g,i} Z_{g,i}^T) / c_g
+H(theta) = sum_g theta_g K_g + theta_e I
+```
+
+Each group receives its own genetic variance component `theta_g`.
+
 ## REML Objective
 
 Let:

@@ -707,6 +707,22 @@ def test_rejects_non_psd_weight_matrix():
         st.close()
 
 
+def test_weight_validation_fast_path_preserves_npy_memmap(tmp_path):
+    path = tmp_path / "W.npy"
+    np.save(path, np.eye(4, dtype=np.float32))
+    raw = np.load(path, mmap_mode="r")
+
+    W = SMILE.validate_weight_matrix(
+        raw,
+        check_psd=False,
+        check_symmetry=False,
+    )
+
+    assert W.dtype == np.float32
+    assert W.flags.c_contiguous
+    assert np.shares_memory(W, raw)
+
+
 def test_load_real_rds_ld_weight_matrix_if_available():
     path = os.environ.get("GPU_REML_SMILE_RDS_FIXTURE")
     if not path:

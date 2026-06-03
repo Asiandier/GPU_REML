@@ -481,6 +481,7 @@ class InfinitesimalREMLFitter:
                 raise ValueError("SMILE block-W mode requires exactly one dense genotype source.")
             from .smile_block_w import SmileBlockWeightedOperator, SmileMultiBlockWeightedOperator
 
+            smile_build_t0 = time.time()
             if cfg.smile_identity:
                 self._smile_operators = (
                     SmileBlockWeightedOperator.identity(
@@ -534,6 +535,12 @@ class InfinitesimalREMLFitter:
                     ),
                 )
             self._smile_operator = self._smile_operators[0] if self._smile_operators else None
+            logger.info(
+                "SMILE operator construction done in %.2fs; n_grm=%d n_blocks=%d",
+                time.time() - smile_build_t0,
+                len(self._smile_operators),
+                sum(op.n_blocks for op in self._smile_operators),
+            )
 
         if self._n_dense_streamers > 1:
             self._dense_call_plan = tuple(

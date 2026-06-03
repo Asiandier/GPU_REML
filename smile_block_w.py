@@ -199,10 +199,11 @@ def validate_weight_matrix(
     name: str = "W",
     symmetrize: bool = True,
     symmetry_tol: float = 1e-6,
+    check_symmetry: bool = True,
     check_psd: bool = True,
     psd_tol: float = 1e-7,
 ) -> np.ndarray:
-    """Return a finite, square, symmetric float32 copy suitable for GPU use."""
+    """Return a finite, square float32 matrix suitable for SMILE GPU use."""
 
     arr = np.asarray(matrix)
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
@@ -212,17 +213,20 @@ def validate_weight_matrix(
     if not np.issubdtype(arr.dtype, np.number):
         raise ValueError(f"{name} must be numeric, got dtype={arr.dtype}.")
 
-    W = np.asarray(arr, dtype=np.float32, order="C")
+    W = np.asarray(arr, dtype=np.float32)
+    if not W.flags.c_contiguous:
+        W = np.asarray(W, dtype=np.float32, order="C")
     if not np.all(np.isfinite(W)):
         raise ValueError(f"{name} contains non-finite values.")
 
-    max_abs = float(np.max(np.abs(W))) if W.size else 0.0
-    asym = _max_abs_symmetric_difference(W)
-    allowed_asym = float(symmetry_tol * max(1.0, max_abs))
-    if asym > allowed_asym:
-        raise ValueError(f"{name} is not symmetric: max |W-W.T|={asym:g}.")
-    if symmetrize and asym > 0.0:
-        W = np.asarray(0.5 * (W + W.T), dtype=np.float32, order="C")
+    if check_symmetry:
+        max_abs = float(np.max(np.abs(W))) if W.size else 0.0
+        asym = _max_abs_symmetric_difference(W)
+        allowed_asym = float(symmetry_tol * max(1.0, max_abs))
+        if asym > allowed_asym:
+            raise ValueError(f"{name} is not symmetric: max |W-W.T|={asym:g}.")
+        if symmetrize and asym > 0.0:
+            W = np.asarray(0.5 * (W + W.T), dtype=np.float32, order="C")
 
     if check_psd:
         eigvals = np.linalg.eigvalsh(np.asarray(W, dtype=np.float64))
@@ -342,6 +346,7 @@ class SmileBlockWeightedOperator:
                 raw_W,
                 name=f"W[{idx}]",
                 symmetrize=symmetrize,
+                check_symmetry=check_psd,
                 check_psd=check_psd,
             )
             start = (

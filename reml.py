@@ -857,6 +857,7 @@ def fit_reml(
     early_pcg_tol: float = 5e-3,
     default_pcg_tol: float = 1e-3,
     verbose: bool = True,
+    return_diagnostics: bool = False,
 ):
     """Fit single-trait Gaussian REML with AI/Fisher updates.
 
@@ -1351,6 +1352,18 @@ def fit_reml(
         _t1 = time.time()
         logger.info("[REML] done @ %s elapsed=%.1fs stop=%s",
                     datetime.now().isoformat(timespec='seconds'), _t1 - _t0, stop_reason)
+    if return_diagnostics:
+        fi_mat = FI.mat if isinstance(FI, AverageInfoMatrix) else FI
+        diagnostics = {
+            "theta": param,
+            "grad": grad,
+            "ai": fi_mat,
+            "loglik": ll,
+            "stop_reason": stop_reason,
+            "y_mean": y_mean,
+            "y_scale": y_scale,
+        }
+        return param, history, diagnostics
     return param, history
 
 

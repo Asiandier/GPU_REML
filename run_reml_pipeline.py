@@ -134,6 +134,44 @@ def parse_args():
         help="Structured component spec (.json or .npz) with optional names/metadata for arbitrary single-file multi-GRM.",
     )
     p.add_argument(
+        "--merge",
+        action="store_true",
+        default=False,
+        help="Run z-score one-shot weak-component merge: fit fine model, merge weak components, then refit once.",
+    )
+    p.add_argument(
+        "--merge-out-dir",
+        default=env("MERGE_OUT_DIR", ""),
+        help="Output directory for --merge rounds. Defaults to <out-prefix>.merge when --out-prefix is set.",
+    )
+    p.add_argument(
+        "--merge-mode",
+        choices=["global_weak"],
+        default=env("MERGE_MODE", "global_weak"),
+        help=(
+            "Weak-component merge mode for --merge. The stable production path "
+            "keeps active components and merges all weak components into one GRM."
+        ),
+    )
+    p.add_argument(
+        "--z-cutoff",
+        type=float,
+        default=float(env("Z_CUTOFF", "1.6448536269514722")),
+        help="Z-score cutoff for --merge active-component selection.",
+    )
+    p.add_argument(
+        "--merge-ai-scale-mode",
+        choices=["per_sample", "full"],
+        default=env("MERGE_AI_SCALE_MODE", "per_sample"),
+        help="AI scale used when computing z-score SEs for --merge.",
+    )
+    p.add_argument(
+        "--merge-n-eff",
+        type=float,
+        default=float(env("MERGE_N_EFF", "0")),
+        help="Effective sample size for --merge z-score SEs; 0 counts non-empty keep-path rows.",
+    )
+    p.add_argument(
         "--smile",
         action="store_true",
         default=env("SMILE", "").strip().lower() in {"1", "true", "yes", "on"},
@@ -247,6 +285,12 @@ def parse_args():
     p.add_argument("--out-prefix", default=env("OUT_PREFIX", ""),
                    help="Output prefix for effect / prediction files.")
     p.add_argument(
+        "--export-ai",
+        action="store_true",
+        default=env("EXPORT_AI", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Write final variance components, Average Information matrix, gradient and fit metadata to <out-prefix>.*.",
+    )
+    p.add_argument(
         "--verbose",
         action="store_true",
         default=env("VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"},
@@ -256,6 +300,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.merge:
+        merge_mod = importlib.import_module(f"{pkg_name}.zscore_merge")
+        merge_mod.run_from_pipeline_args(args)
+        return
+
     logger.info("start @ %s", datetime.now().isoformat(timespec='seconds'))
     t0 = time.time()
 
@@ -346,8 +395,8 @@ def main():
             raise SystemExit("single-source component partitioning is currently supported only for dense-only fits.")
     if not args.pheno_txt:
         raise SystemExit("--pheno-txt is required.")
-    if (args.compute_effects or prediction_active) and not args.out_prefix:
-        raise SystemExit("--compute-effects / prediction inputs require --out-prefix.")
+    if (args.compute_effects or prediction_active or args.export_ai) and not args.out_prefix:
+        raise SystemExit("--compute-effects / prediction inputs / --export-ai require --out-prefix.")
     if prediction_active:
         _pred_dense = sum(bool(x) for x in [args.prediction_bed_prefix.strip(), args.prediction_pgen_prefix.strip()])
         if _pred_dense != 1:
@@ -553,6 +602,7 @@ def main():
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
             precond_refresh_reldp=args.precond_refresh_reldp,
             precond_type=args.precond_type, precond_rank=precond_rank,
+            capture_reml_diagnostics=bool(args.export_ai),
             verbose=args.verbose)
     else:
         cfg = FitConfig(
@@ -579,6 +629,7 @@ def main():
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
             precond_refresh_reldp=args.precond_refresh_reldp,
             precond_type=args.precond_type, precond_rank=precond_rank,
+            capture_reml_diagnostics=bool(args.export_ai),
             verbose=args.verbose)
 
     logger.info("fit start @ %s", datetime.now().isoformat(timespec='seconds'))
@@ -603,6 +654,38 @@ def main():
             pcg = it.get("pcg_iters", 0)
             print(f"  iter {int(it['iter']):03d}: ll={it.get('loglik',float('nan')):.4g} "
                   f"rel_dll={it.get('rel_dll',float('nan')):.3e} pcg={pcg}")
+
+    if args.export_ai:
+        theta_path = args.out_prefix + ".theta.npy"
+        ai_path = args.out_prefix + ".ai.npy"
+        grad_path = args.out_prefix + ".grad.npy"
+        meta_path = args.out_prefix + ".ai_stats.json"
+        np.save(theta_path, np.asarray(jax.device_get(res.var_components), dtype=np.float64))
+        if res.final_ai is None or res.final_grad is None:
+            raise RuntimeError("--export-ai requested but REML diagnostics were not captured.")
+        np.save(ai_path, np.asarray(jax.device_get(res.final_ai), dtype=np.float64))
+        np.save(grad_path, np.asarray(jax.device_get(res.final_grad), dtype=np.float64))
+        import json
+        with open(meta_path, "w") as f:
+            json.dump(
+                {
+                    "n_samples": int(y_np.shape[0]),
+                    "n_covar": int(X_np.shape[1]) if X_np is not None else 0,
+                    "n_components": int(vc.size - 1),
+                    "loglik": None if res.final_loglik is None else float(res.final_loglik),
+                    "theta_npy": theta_path,
+                    "ai_npy": ai_path,
+                    "grad_npy": grad_path,
+                    "component_spec": component_spec_source or None,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                f,
+                indent=2,
+                sort_keys=True,
+            )
+        print(f"export_ai: theta={theta_path}")
+        print(f"export_ai: ai={ai_path}")
+        print(f"export_ai: grad={grad_path}")
 
     if args.compute_effects:
         if res.effects is None:

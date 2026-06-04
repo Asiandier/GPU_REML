@@ -69,6 +69,7 @@ class FitConfig:
     source_build_chunk_width: int | None = None
     verbose: bool = True
     gpu_budget_bytes: float | None = None
+    capture_reml_diagnostics: bool = False
 
 
 @dataclasses.dataclass
@@ -104,6 +105,10 @@ class FitResult:
     jackknife_se_var: Optional[jnp.ndarray] = None
     jackknife_se_h2: Optional[float] = None
     effects: Optional[EffectEstimates] = None
+    final_ai: Optional[jnp.ndarray] = None
+    final_grad: Optional[jnp.ndarray] = None
+    final_loglik: Optional[float] = None
+    diagnostics: Optional[dict[str, object]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1455,9 +1460,10 @@ class InfinitesimalREMLFitter:
         self._ensure_projected_core_precond_ready(ops, var_components_init=var_components_init)
 
         reps = []
+        diagnostics = None
         n_reps = max(1, int(self.cfg.n_reml_reps))
         for r in range(n_reps):
-            vc, history = fit_reml(
+            fit_out = fit_reml(
                 y=jnp.asarray(y, dtype=jnp.float32),
                 K_mvs=ops.K_mvs,
                 diag_list=ops.diag_list,
@@ -1484,8 +1490,13 @@ class InfinitesimalREMLFitter:
                     if self._smile_operators else "strict"
                 ),
                 scoring_step_tol=self.cfg.smile_scoring_step_tol,
+                return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
                 verbose=self.cfg.verbose,
             )
+            if bool(self.cfg.capture_reml_diagnostics):
+                vc, history, diagnostics = fit_out
+            else:
+                vc, history = fit_out
             reps.append((vc, history))
 
         vc_mean = reps[0][0]
@@ -1522,6 +1533,14 @@ class InfinitesimalREMLFitter:
             jackknife_se_var=jackknife_se_var,
             jackknife_se_h2=jackknife_se_h2,
             effects=effects,
+            final_ai=None if diagnostics is None else diagnostics.get("ai"),
+            final_grad=None if diagnostics is None else diagnostics.get("grad"),
+            final_loglik=(
+                None
+                if diagnostics is None
+                else float(jax.device_get(diagnostics.get("loglik")))
+            ),
+            diagnostics=diagnostics,
         )
         if self.cfg.verbose:
             logger.info("fit_infinitesimal done @ %s elapsed=%.1fs",

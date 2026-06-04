@@ -199,6 +199,26 @@ gpu-reml \
   --out-prefix out/partitioned
 ```
 
+Z-score one-shot weak-component merge:
+
+```bash
+gpu-reml \
+  --merge \
+  --bed-prefix /path/to/data \
+  --component-spec fine_components.json \
+  --pheno-txt pheno.txt \
+  --covar-txt covar.txt \
+  --keep-path keep.txt \
+  --out-prefix out/zscore_merge
+```
+
+This mode first fits the fine component model, computes component-level
+Wald-style z-scores from the fitted variance components and AI matrix, keeps
+components with `z >= 1.6448536269514722`, merges all weaker components into one
+background GRM, and refits once. The stable merge mode is `global_weak`; it uses
+a single genotype source plus `--component-spec` and does not require LD-score
+metadata.
+
 SMILE-style block-diagonal weighted GRM:
 
 ```bash

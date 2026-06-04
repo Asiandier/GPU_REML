@@ -215,9 +215,7 @@ gpu-reml \
 This mode first fits the fine component model, computes component-level
 Wald-style z-scores from the fitted variance components and AI matrix, keeps
 components with `z >= 1.6448536269514722`, merges all weaker components into one
-background GRM, and refits once. The stable merge mode is `global_weak`; it uses
-a single genotype source plus `--component-spec` and does not require LD-score
-metadata.
+background GRM, and refits once.
 
 SMILE-style block-diagonal weighted GRM:
 

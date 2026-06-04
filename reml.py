@@ -849,6 +849,8 @@ def fit_reml(
     residual_floor: float = 1e-2,
     genetic_zero_tol: float = 1e-8,
     max_linesearch_trials: int = 3,
+    optimizer: str = "strict",
+    scoring_step_tol: float = 1e-4,
     rel_dll_tol: float = 1e-3,
     taylor_threshold: float = 0.01,
     warmup_pcg_tol: float = 1e-2,
@@ -885,6 +887,10 @@ def fit_reml(
         raise ValueError("genetic_zero_tol must be >= 0.")
     if max_linesearch_trials < 1:
         raise ValueError("max_linesearch_trials must be >= 1.")
+    if optimizer not in {"strict", "smile_scoring"}:
+        raise ValueError("optimizer must be 'strict' or 'smile_scoring'.")
+    if scoring_step_tol < 0.0:
+        raise ValueError("scoring_step_tol must be >= 0.")
     if rel_dll_tol < 0.0:
         raise ValueError("rel_dll_tol must be >= 0.")
     if taylor_threshold < 0.0:
@@ -1125,7 +1131,8 @@ def fit_reml(
         trial_warm_ready = warm_ready
         trial_warm_ai_ready = warm_ai_ready
 
-        while trial_count < max_linesearch_trials:
+        trial_limit = 1 if optimizer == "smile_scoring" else max_linesearch_trials
+        while trial_count < trial_limit:
             trial_count += 1
             alpha_used = alpha_try
             step_t0 = time.perf_counter()
@@ -1205,8 +1212,9 @@ def fit_reml(
                 else 0
             )
             eval_ai_pcg = ai_pcg_trial
-            ls_trace.append((alpha_used, dll, dll >= 0.0, k_pcg_trial, ai_pcg_trial, trial_use_taylor))
-            if dll >= 0.0:
+            trial_accepted = (dll >= 0.0) or optimizer == "smile_scoring"
+            ls_trace.append((alpha_used, dll, trial_accepted, k_pcg_trial, ai_pcg_trial, trial_use_taylor))
+            if trial_accepted:
                 accepted = True
                 ll_new = ll_try
                 grad_new = grad_try
@@ -1246,7 +1254,10 @@ def fit_reml(
         )
         dll = float(ll_new_host - ll_host)
         rel_improve = dll / max(abs(float(ll_host)), 1e-12)
-        status = "accept" if accepted else "ll_down"
+        if accepted:
+            status = "accept" if dll >= 0.0 else "accept_downhill"
+        else:
+            status = "ll_down"
         dparam_str  = "[" + ", ".join(f"{float(v):.3e}" for v in np.asarray(delta_param_host).reshape(-1)) + "]"
 
         history.append({
@@ -1322,9 +1333,12 @@ def fit_reml(
             # freshly computed value; on Taylor iterations, the Taylor estimate
             # becomes the new anchor (it is the best available estimate).
             logdet_cached = logdet_new
-            should_stop = (not math.isfinite(rel_improve)) or (rel_improve < rel_dll_tol)
+            if optimizer == "smile_scoring":
+                should_stop = (not math.isfinite(rel_improve)) or (max_rel_dp < scoring_step_tol)
+            else:
+                should_stop = (not math.isfinite(rel_improve)) or (rel_improve < rel_dll_tol)
             if should_stop:
-                stop_reason = "rel_dll"
+                stop_reason = "scoring_step" if optimizer == "smile_scoring" else "rel_dll"
                 break
         else:
             stop_reason = "ll_down"

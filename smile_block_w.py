@@ -255,28 +255,10 @@ def load_weight_matrix_metadata(
     return meta
 
 
-def _max_abs_symmetric_difference(W: np.ndarray, *, block_rows: int = 2048) -> float:
-    """Return max |W-W.T| without materializing a full dense difference."""
-
-    n = int(W.shape[0])
-    max_diff = 0.0
-    block = max(1, int(block_rows))
-    for start in range(0, n, block):
-        stop = min(start + block, n)
-        diff = np.max(np.abs(W[start:stop, :] - W[:, start:stop].T))
-        max_diff = max(max_diff, float(diff))
-    return max_diff
-
-
 def validate_weight_matrix(
     matrix: np.ndarray,
     *,
     name: str = "W",
-    symmetrize: bool = True,
-    symmetry_tol: float = 1e-6,
-    check_symmetry: bool = True,
-    check_psd: bool = True,
-    psd_tol: float = 1e-7,
 ) -> np.ndarray:
     """Return a finite, square float32 matrix suitable for SMILE GPU use."""
 
@@ -293,23 +275,6 @@ def validate_weight_matrix(
         W = np.asarray(W, dtype=np.float32, order="C")
     if not np.all(np.isfinite(W)):
         raise ValueError(f"{name} contains non-finite values.")
-
-    if check_symmetry:
-        max_abs = float(np.max(np.abs(W))) if W.size else 0.0
-        asym = _max_abs_symmetric_difference(W)
-        allowed_asym = float(symmetry_tol * max(1.0, max_abs))
-        if asym > allowed_asym:
-            raise ValueError(f"{name} is not symmetric: max |W-W.T|={asym:g}.")
-        if symmetrize and asym > 0.0:
-            W = np.asarray(0.5 * (W + W.T), dtype=np.float32, order="C")
-
-    if check_psd:
-        eigvals = np.linalg.eigvalsh(np.asarray(W, dtype=np.float64))
-        eig_min = float(eigvals[0])
-        eig_max = float(eigvals[-1])
-        if eig_min < -float(psd_tol) * max(1.0, abs(eig_max)):
-            raise ValueError(f"{name} is not positive semidefinite: min eigenvalue={eig_min:g}.")
-
     return W
 
 
@@ -423,8 +388,6 @@ class SmileBlockWeightedOperator:
         *,
         normalization: Normalization = "kernel_trace",
         strict_coverage: bool = True,
-        symmetrize: bool = True,
-        check_psd: bool = True,
         sources: Sequence[str | None] | None = None,
         start_offsets: Sequence[int] | None = None,
         effective_ranks: Sequence[float] | None = None,
@@ -460,9 +423,6 @@ class SmileBlockWeightedOperator:
             W = validate_weight_matrix(
                 raw_W,
                 name=f"W[{idx}]",
-                symmetrize=symmetrize,
-                check_symmetry=check_psd,
-                check_psd=check_psd,
             )
             start = (
                 int(start_offsets[idx])
@@ -1005,8 +965,6 @@ class SmileMultiBlockWeightedOperator:
         *,
         normalization: Normalization = "kernel_trace",
         strict_coverage: bool = True,
-        symmetrize: bool = True,
-        check_psd: bool = True,
         source_groups: Sequence[Sequence[str | None]] | None = None,
         effective_rank_groups: Sequence[Sequence[float]] | None = None,
         diag_mode: DiagMode = "full",
@@ -1048,8 +1006,6 @@ class SmileMultiBlockWeightedOperator:
                     group,
                     normalization=normalization,
                     strict_coverage=False,
-                    symmetrize=symmetrize,
-                    check_psd=check_psd,
                     sources=sources,
                     start_offsets=starts,
                     effective_ranks=effective_ranks,

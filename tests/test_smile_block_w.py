@@ -66,7 +66,6 @@ def test_identity_block_weights_match_existing_global_kv():
             st,
             [np.eye(4), np.eye(6)],
             normalization="kernel_trace",
-            check_psd=True,
         )
         got = np.asarray(op.kv(V))
         ref = np.asarray(st.kv(V))
@@ -127,7 +126,6 @@ def test_weighted_blocks_match_explicit_matrix_reference():
             st,
             [W0, W1],
             normalization="kernel_trace",
-            check_psd=True,
         )
         got = np.asarray(op.kv(jnp.asarray(V)))
 
@@ -166,14 +164,12 @@ def test_weighted_operator_can_cache_w_on_device():
             st,
             [W0, W1],
             normalization="kernel_trace",
-            check_psd=True,
             device_cache_max_bytes=0,
         )
         cached = SmileBlockWeightedOperator(
             st,
             [W0, W1],
             normalization="kernel_trace",
-            check_psd=True,
             device_cache_max_bytes=16 * 1024 * 1024,
         )
 
@@ -204,7 +200,6 @@ def test_global_trace_normalization_sets_average_diagonal_to_one():
             st,
             [W0, W1],
             normalization="kernel_trace",
-            check_psd=True,
         )
         trace_value = 0.0
         for block in op.blocks:
@@ -248,7 +243,6 @@ def test_effective_rank_normalization_uses_sidecar_metadata(tmp_path):
             st,
             paths,
             normalization="effective_rank",
-            check_psd=False,
         )
         assert op.normalizer == pytest.approx(sum(ranks), rel=1e-7)
 
@@ -280,7 +274,6 @@ def test_effective_rank_normalization_requires_sidecar_metadata(tmp_path):
                 st,
                 [path],
                 normalization="effective_rank",
-                check_psd=False,
             )
     finally:
         st.close()
@@ -305,14 +298,12 @@ def test_mean_diag_mode_keeps_exact_normalizer_but_returns_scalar_diag():
             st,
             [W0, W1],
             normalization="kernel_trace",
-            check_psd=True,
             diag_mode="full",
         )
         mean = SmileBlockWeightedOperator(
             st,
             [W0, W1],
             normalization="kernel_trace",
-            check_psd=True,
             diag_mode="mean",
         )
         assert mean.normalizer == pytest.approx(full.normalizer, rel=1e-6)
@@ -342,7 +333,6 @@ def test_weighted_hv_uses_single_genetic_variance_component():
             st,
             [np.eye(3), np.eye(4)],
             normalization="kernel_trace",
-            check_psd=True,
         )
         theta_g = jnp.asarray(0.25, dtype=jnp.float32)
         theta_e = jnp.asarray(0.35, dtype=jnp.float32)
@@ -376,7 +366,6 @@ def test_multi_grm_groups_sum_blocks_inside_each_grm():
             st,
             [[mats[0], mats[1]], [mats[2]]],
             normalization="kernel_trace",
-            check_psd=True,
         )
         assert multi.n_grm == 2
         assert [block.start for block in multi.operators[0].blocks] == [0, 2]
@@ -429,7 +418,6 @@ def test_snp_effects_include_block_weight_matrix():
             st,
             [W0, W1],
             normalization="kernel_trace",
-            check_psd=True,
         )
         got = np.asarray(op.snp_effects(alpha, theta_g))
         ref_parts = []
@@ -457,7 +445,8 @@ def test_fitter_assembles_smile_single_kernel_reml_operator(monkeypatch):
     )
 
     def _fake_fit_reml(*, y, K_mvs, diag_list, weighted_hv=None, stacked_kv=None, **_kwargs):
-        del y, _kwargs
+        del y
+        assert _kwargs["optimizer"] == "smile_scoring"
         assert len(K_mvs) == 1
         assert len(diag_list) == 1
         assert weighted_hv is not None
@@ -486,6 +475,7 @@ def test_fitter_assembles_smile_single_kernel_reml_operator(monkeypatch):
         smile_weight_matrices=[np.eye(3), np.eye(4)],
         call_width=3,
         keep_host_stats=False,
+        smile_optimizer="smile_scoring",
         precond_rank=0,
         verbose=False,
     )
@@ -626,7 +616,6 @@ def test_file_groups_compute_exact_trace_normalizer(tmp_path):
             st,
             [[paths[0]], [paths[1]]],
             normalization="kernel_trace",
-            check_psd=False,
         )
         assert multi.n_grm == 2
         expected = []
@@ -731,18 +720,13 @@ def test_fitter_runs_implicit_smile_identity_end_to_end():
         fitter.close()
 
 
-def test_rejects_non_psd_weight_matrix():
-    X = _make_non_degenerate_genotypes(n=12, m=2, seed=207)
-    st = GenoBlockStreamer(_ArraySource(X), call_width=2, keep_host_stats=True)
-    try:
-        with pytest.raises(ValueError, match="positive semidefinite"):
-            SmileBlockWeightedOperator(
-                st,
-                [np.asarray([[1.0, 0.0], [0.0, -0.1]])],
-                check_psd=True,
-            )
-    finally:
-        st.close()
+def test_weight_validation_trusts_finite_square_matrix():
+    W = np.asarray([[1.0, 2.0], [0.0, -0.1]], dtype=np.float64)
+
+    got = SMILE.validate_weight_matrix(W)
+
+    assert got.dtype == np.float32
+    assert np.allclose(got, W.astype(np.float32))
 
 
 def test_weight_validation_fast_path_preserves_npy_memmap(tmp_path):
@@ -752,8 +736,6 @@ def test_weight_validation_fast_path_preserves_npy_memmap(tmp_path):
 
     W = SMILE.validate_weight_matrix(
         raw,
-        check_psd=False,
-        check_symmetry=False,
     )
 
     assert W.dtype == np.float32

@@ -183,11 +183,20 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--no-w-psd-check",
-        dest="no_w_psd_check",
-        action="store_true",
-        default=env("SMILE_NO_W_PSD_CHECK", "").strip().lower() in {"1", "true", "yes", "on"},
-        help="Disable eigenvalue PSD checks for W_i matrices.",
+        "--smile-optimizer",
+        choices=["strict", "smile_scoring"],
+        default=env("SMILE_OPTIMIZER", "strict"),
+        help=(
+            "SMILE-only variance-component optimizer. strict keeps GPU_REML's "
+            "monotone line-search; smile_scoring uses a SMILE-style full scoring "
+            "step that can accept downhill REML objective evaluations."
+        ),
+    )
+    p.add_argument(
+        "--smile-scoring-step-tol",
+        type=float,
+        default=float(env("SMILE_SCORING_STEP_TOL", "1e-4")),
+        help="Relative parameter-change tolerance for --smile-optimizer smile_scoring.",
     )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
@@ -509,7 +518,7 @@ def main():
             )
     if use_smile:
         logger.info(
-            "SMILE block-W mode enabled with %s; normalization=%s psd_check=%s",
+            "SMILE block-W mode enabled with %s; normalization=%s",
             (
                 "identity W"
                 if args.identity_w
@@ -518,7 +527,6 @@ def main():
                 else f"{len(smile_w_files)} W block file(s)"
             ),
             args.w_normalization,
-            not args.no_w_psd_check,
         )
 
     if sources is not None:
@@ -533,8 +541,9 @@ def main():
             smile_weight_matrix_groups=smile_weight_matrix_groups,
             smile_identity=args.identity_w,
             smile_normalization=args.w_normalization,
-            smile_check_psd=not args.no_w_psd_check,
             smile_w_device_cache_bytes=getattr(plan, "smile_w_device_cache_bytes", None),
+            smile_optimizer=args.smile_optimizer,
+            smile_scoring_step_tol=args.smile_scoring_step_tol,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
@@ -558,8 +567,9 @@ def main():
             smile_weight_matrix_groups=smile_weight_matrix_groups,
             smile_identity=args.identity_w,
             smile_normalization=args.w_normalization,
-            smile_check_psd=not args.no_w_psd_check,
             smile_w_device_cache_bytes=getattr(plan, "smile_w_device_cache_bytes", None),
+            smile_optimizer=args.smile_optimizer,
+            smile_scoring_step_tol=args.smile_scoring_step_tol,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,

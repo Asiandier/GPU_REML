@@ -42,9 +42,10 @@ class FitConfig:
     smile_identity_block_size: int | None = None
     smile_normalization: str = "kernel_trace"
     smile_diag_mode: str = "mean"
-    smile_check_psd: bool = True
     smile_strict_coverage: bool = True
     smile_w_device_cache_bytes: float | None = None
+    smile_optimizer: str = "strict"
+    smile_scoring_step_tol: float = 1e-4
     standardization_overrides: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
     sample_mask: np.ndarray | None = None  # bool mask for sample subsetting
     call_width: int = 131072
@@ -508,7 +509,6 @@ class InfinitesimalREMLFitter:
                     list(cfg.smile_weight_matrix_groups),
                     normalization=cfg.smile_normalization,
                     strict_coverage=cfg.smile_strict_coverage,
-                    check_psd=cfg.smile_check_psd,
                     diag_mode=cfg.smile_diag_mode,
                     device_cache_max_bytes=smile_w_cache_bytes,
                 )
@@ -519,7 +519,6 @@ class InfinitesimalREMLFitter:
                     list(cfg.smile_w_file_groups),
                     normalization=cfg.smile_normalization,
                     strict_coverage=cfg.smile_strict_coverage,
-                    check_psd=cfg.smile_check_psd,
                     diag_mode=cfg.smile_diag_mode,
                     device_cache_max_bytes=smile_w_cache_bytes,
                 )
@@ -531,7 +530,6 @@ class InfinitesimalREMLFitter:
                         list(cfg.smile_weight_matrices),
                         normalization=cfg.smile_normalization,
                         strict_coverage=cfg.smile_strict_coverage,
-                        check_psd=cfg.smile_check_psd,
                         diag_mode=cfg.smile_diag_mode,
                         device_cache_max_bytes=smile_w_cache_bytes,
                     ),
@@ -543,7 +541,6 @@ class InfinitesimalREMLFitter:
                         list(cfg.smile_w_files or ()),
                         normalization=cfg.smile_normalization,
                         strict_coverage=cfg.smile_strict_coverage,
-                        check_psd=cfg.smile_check_psd,
                         diag_mode=cfg.smile_diag_mode,
                         device_cache_max_bytes=smile_w_cache_bytes,
                     ),
@@ -1482,6 +1479,11 @@ class InfinitesimalREMLFitter:
                 precond_eps=self.cfg.pcg_ridge,
                 weighted_hv=ops.weighted_hv,
                 stacked_kv=ops.stacked_kv,
+                optimizer=(
+                    self.cfg.smile_optimizer
+                    if self._smile_operators else "strict"
+                ),
+                scoring_step_tol=self.cfg.smile_scoring_step_tol,
                 verbose=self.cfg.verbose,
             )
             reps.append((vc, history))

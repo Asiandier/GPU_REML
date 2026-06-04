@@ -86,6 +86,47 @@ def test_fitter_passes_source_build_chunk_width_to_dense_streamer(monkeypatch):
     assert len(fitter.streamers) == 1
 
 
+def test_non_smile_path_forces_strict_optimizer(monkeypatch):
+    captured: list[str] = []
+
+    @dataclass
+    class _FakeStreamer:
+        n: int = 8
+        m: int = 16
+        _n_calls: int = 1
+
+        def kv(self, V, normalize=True):
+            del normalize
+            return V
+
+        def diag(self):
+            return jnp.ones((self.n,), dtype=jnp.float32)
+
+    def _fake_streamer(**_kwargs):
+        return _FakeStreamer()
+
+    def _fake_fit_reml(*, optimizer="strict", **_kwargs):
+        captured.append(optimizer)
+        return jnp.asarray([0.2, 0.8], dtype=jnp.float32), [{"iter": 1}]
+
+    monkeypatch.setattr(f"{_PKG}.reml_model.GenoBlockStreamer", _fake_streamer)
+    monkeypatch.setattr(f"{_PKG}.reml_model.fit_reml", _fake_fit_reml)
+
+    cfg = FitConfig(
+        sources=[object()],
+        smile_optimizer="smile_scoring",
+        precond_rank=0,
+        verbose=False,
+    )
+    fitter = InfinitesimalREMLFitter(cfg)
+    try:
+        res = fitter.fit_infinitesimal(jnp.ones((8,), dtype=jnp.float32))
+        assert np.allclose(np.asarray(res.var_components), [0.2, 0.8])
+        assert captured == ["strict"]
+    finally:
+        fitter.close()
+
+
 def test_fitter_builds_sparse_streamer_for_rare_sources(monkeypatch):
     captured_dense: list[int] = []
     captured_sparse: list[int] = []

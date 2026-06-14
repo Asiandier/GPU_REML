@@ -298,7 +298,9 @@ def solve_lasso_path_and_select_ebic(
 
     Args:
         Q, q: weighted quadratic system.
-        yHy: y^T H^{-1} y.
+        yHy: constant term for the quadratic RSS represented by Q and q.
+            This is y^T H^{-1} y without unpenalized covariates, and the
+            profiled constant after projecting out covariates otherwise.
         n_samples: sample size used in EBIC.
         p_total: total number of SNPs in full genome (for EBIC combinatorics).
     """
@@ -310,8 +312,10 @@ def solve_lasso_path_and_select_ebic(
     lam_max = float(np.max(np.abs(q))) if q.size > 0 else 0.0
     lam_seq = make_lambda_sequence(lam_max, cfg.lam_min_ratio, cfg.n_lambda)
 
-    # Numerical floor scales with yHy and n.
-    ebic_eps = max(float(cfg.ebic_eps), 1e-8 * max(float(yHy), 1.0))
+    rss0 = float(yHy)
+
+    # Numerical floor scales with the RSS constant and n.
+    ebic_eps = max(float(cfg.ebic_eps), 1e-8 * max(rss0, 1.0))
 
     best_idx = 0
     best_ebic = float("inf")
@@ -334,7 +338,7 @@ def solve_lasso_path_and_select_ebic(
         )
         beta_warm = beta
 
-        rss = max(float(yHy - 2.0 * (beta @ q) + (beta @ Qb)), 0.0)
+        rss = max(float(rss0 - 2.0 * (beta @ q) + (beta @ Qb)), 0.0)
         k = int(np.count_nonzero(beta))
         ebic = ebic_from_rss(
             n=n_samples,
@@ -466,6 +470,7 @@ def fit_weighted_lasso_with_covariates(
     # Compute Gram products in float64 to avoid float32 accumulation error.
     # For n=50k, k=256, float32 matmul can lose ~3 digits of precision.
     yHy = float(y @ Hy)
+    profile_yHy = yHy
     gZy = Z.T @ Hy
     GZZ = Z.T @ HZ
     GCC = None
@@ -497,6 +502,7 @@ def fit_weighted_lasso_with_covariates(
         Ainv_gCy = _solve_factorized_system(gcc_factor, gCy)
         Ainv_GCZ = _solve_factorized_system(gcc_factor, GCZ)
 
+        profile_yHy = float(yHy - gCy @ Ainv_gCy)
         Q = GZZ - GCZ.T @ Ainv_GCZ
         Q = 0.5 * (Q + Q.T)
         q = gZy - GCZ.T @ Ainv_gCy
@@ -512,7 +518,7 @@ def fit_weighted_lasso_with_covariates(
     lasso = solve_lasso_path_and_select_ebic(
         Q=Q,
         q=q,
-        yHy=yHy,
+        yHy=profile_yHy,
         n_samples=n,
         p_total=int(p_total),
         cfg=cfg,

@@ -5,14 +5,13 @@ Thank you for considering a contribution to GPU_REML.
 ## Development Setup
 
 ```bash
-python -m pip install -e ".[dev]"
-python -m pytest -q
+python -m pip install -e .
 ```
 
 Optional PGEN support:
 
 ```bash
-python -m pip install -e ".[dev,pgen]"
+python -m pip install -e ".[pgen]"
 ```
 
 ## Checks Before Submitting
@@ -20,13 +19,12 @@ python -m pip install -e ".[dev,pgen]"
 Run:
 
 ```bash
-python -m pytest -q
 python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/gpu_reml_wheel .
 ```
 
 For changes touching genotype streaming, REML scoring, PCG, preconditioning,
-or sparse paths, add focused tests that compare against a dense or analytically
-simple reference.
+or sparse paths, validate against a dense or analytically simple reference
+before publishing.
 
 ## Coding Guidelines
 

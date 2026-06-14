@@ -20,10 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pgen = ["pgenlib>=0.90"]
-dev = [
-    "pytest>=7.0",
-    "pgenlib>=0.90",
-]
+dev = []
 
 [project.scripts]
 gpu-reml = "GPU_REML.run_reml_pipeline:main"
@@ -33,6 +30,3 @@ gpu-reml-gwas = "GPU_REML.run_gwas_pipeline:main"
 [tool.setuptools]
 packages = ["GPU_REML"]
 package-dir = { "GPU_REML" = "." }
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

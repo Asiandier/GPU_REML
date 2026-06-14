@@ -141,7 +141,7 @@ python -m pip install -e ".[pgen]"
 Development install:
 
 ```bash
-python -m pip install -e ".[dev]"
+python -m pip install -e .
 ```
 
 Check that JAX can see the GPU:
@@ -153,7 +153,7 @@ print(jax.devices())
 PY
 ```
 
-CPU-only JAX is sufficient for tests and small examples. Large REML jobs are
+CPU-only JAX is sufficient for small examples. Large REML jobs are
 intended for GPU execution.
 
 ## Quick Start
@@ -383,26 +383,12 @@ budget and the genotype-streaming ring depth.
 
 ## Validation
 
-Run the test suite:
-
-```bash
-python -m pytest -q
-```
-
 Build a wheel:
 
 ```bash
 python -m pip wheel --no-deps --no-build-isolation \
   --wheel-dir /tmp/gpu_reml_wheel /path/to/GPU_REML
 ```
-
-The repository includes tests for REML updates, PCG/preconditioning, genotype
-streaming, PGEN/BED sources, partitioned GRMs, SMILE-style weighted GRMs, sparse
-streams, effect estimation, prediction, GWAS, CLI behavior, and packaging.
-
-Large local genotype fixtures under `tests/data/` are intentionally not included
-in the public repository. Tests that require those fixtures are skipped when the
-files are absent.
 
 ## Limitations
 

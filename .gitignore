@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+tests/
 *.egg-info/
 build/
 dist/
@@ -13,8 +14,7 @@ effect_estimate/
 *.csv
 *.png
 
-# Local test datasets are intentionally not pushed to GitHub.
-tests/data/
+# Local tests and test datasets are intentionally not pushed to GitHub.
 
 # Local backup snapshot
 bolt_jax_副本 22-47-38-277/

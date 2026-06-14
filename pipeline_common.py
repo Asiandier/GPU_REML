@@ -7,7 +7,6 @@ import tempfile
 from typing import Optional, Sequence
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as sla
 
@@ -272,19 +271,6 @@ def print_planner_info(
         plan.gpu_peak_gib, plan.ring_depth,
         plan.host_anon_est_gib, plan.host_ring_gib, plan.note,
     )
-
-
-# ---------------------------------------------------------------------------
-# H·V construction
-# ---------------------------------------------------------------------------
-
-def build_hv(K_mvs, theta_g: jnp.ndarray, theta_e: jnp.ndarray):
-    def hv(V: jnp.ndarray) -> jnp.ndarray:
-        acc = theta_e * V
-        for i, mv in enumerate(K_mvs):
-            acc = acc + theta_g[i] * mv(V)
-        return acc
-    return hv
 
 
 # ---------------------------------------------------------------------------

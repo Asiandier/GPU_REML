@@ -619,26 +619,6 @@ def _extract_sparse_index_orders_from_packed(packed_block: np.ndarray, width: in
     )
 
 
-def _extract_sparse_index_orders_from_raw_bed(
-    bed_raw: np.ndarray,
-    snp_start: int,
-    snp_count: int,
-    bytes_per_snp: int,
-    sample_byte_offsets: np.ndarray,
-    sample_bit_shifts: np.ndarray,
-):
-    return _extract_sparse_index_orders(
-        _extract_sparse_csr_from_raw_bed_numba,
-        int(snp_count),
-        bed_raw,
-        int(snp_start),
-        int(snp_count),
-        int(bytes_per_snp),
-        sample_byte_offsets,
-        sample_bit_shifts,
-    )
-
-
 def _extract_sparse_index_orders_from_varmaj(
     block_vm: np.ndarray,
     missing_val: int,

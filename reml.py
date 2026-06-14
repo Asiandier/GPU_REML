@@ -793,35 +793,6 @@ def _apply_projected_step(
     return param_updated, delta_param
 
 
-def _projected_fisher_step(
-    param: Array,
-    grad: Array,
-    FI: Array,
-    *,
-    genetic_zero_tol: float,
-    residual_floor: float,
-    trial_alpha: float = 1.0,
-    workset_log_fn: Optional[Callable[[dict[str, object]], None]] = None,
-) -> tuple[Array, Array, Array, float, Array]:
-    """Projected Fisher-scoring step with reduced freeze-set resolves."""
-    step_dir, alpha_max, freeze_mask = _projected_fisher_direction(
-        param,
-        grad,
-        FI,
-        genetic_zero_tol=genetic_zero_tol,
-        trial_alpha=trial_alpha,
-        workset_log_fn=workset_log_fn,
-    )
-    param_updated, delta_param = _apply_projected_step(
-        param,
-        step_dir,
-        alpha_max,
-        genetic_zero_tol=genetic_zero_tol,
-        residual_floor=residual_floor,
-    )
-    return param_updated, delta_param, step_dir, alpha_max, freeze_mask
-
-
 # ---------------------------------------------------------------------------
 # fit_reml
 # ---------------------------------------------------------------------------

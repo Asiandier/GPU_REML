@@ -22,6 +22,7 @@ DATA_UTILS = importlib.import_module(f"{PKG.__name__}.data_utils")
 FitConfig = REML_MODEL.FitConfig
 InfinitesimalREMLFitter = REML_MODEL.InfinitesimalREMLFitter
 write_prediction_outputs = PRED_IO.write_prediction_outputs
+load_pheno_covar_aligned = DATA_UTILS.load_pheno_covar_aligned
 load_pheno_covar_aligned_with_transform = DATA_UTILS.load_pheno_covar_aligned_with_transform
 load_covar_aligned = DATA_UTILS.load_covar_aligned
 
@@ -679,3 +680,32 @@ def test_training_covar_transform_respects_keep_subset(tmp_path):
     assert X_keep.shape == (2, 2)
     np.testing.assert_allclose(np.asarray(transform.means), np.asarray([15.0], dtype=np.float32))
     np.testing.assert_allclose(np.asarray(transform.stds), np.asarray([5.0], dtype=np.float32))
+
+
+def test_pheno_covar_aligned_drops_valid_samples_outside_keep_subset(tmp_path):
+    fam = tmp_path / "train_keep_plain.fam"
+    pheno = tmp_path / "train_keep_plain.pheno"
+
+    fam.write_text(
+        "f1 i1 0 0 0 -9\n"
+        "f2 i2 0 0 0 -9\n"
+        "f3 i3 0 0 0 -9\n"
+    )
+    pheno.write_text(
+        "f1 i1 1.0\n"
+        "f2 i2 2.0\n"
+        "f3 i3 3.0\n"
+    )
+
+    y, X, keep_ids, dropped = load_pheno_covar_aligned(
+        str(fam),
+        str(pheno),
+        covar_path=None,
+        add_intercept=True,
+        keep_ids=["i1", "i3"],
+    )
+
+    np.testing.assert_allclose(y, np.asarray([1.0, 3.0], dtype=np.float32))
+    np.testing.assert_allclose(X, np.ones((2, 1), dtype=np.float32))
+    assert keep_ids == ["i1", "i3"]
+    assert dropped == ["i2"]

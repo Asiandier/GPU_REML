@@ -606,33 +606,23 @@ def main() -> None:
     for path in temp_paths:
         atexit.register(cleanup_path, path)
 
+    keep_ids = None
+    if args.keep_path and os.path.exists(args.keep_path):
+        keep_ids = read_keep_ids(args.keep_path)
+
     # Use first GRM's FAM as the reference for sample alignment.
     y_np, covar_np, fam_keep, dropped = load_pheno_covar_aligned(
         fam_path=fam_path,
         pheno_path=args.pheno_txt,
         covar_path=args.covar_txt or None,
         add_intercept=True,
+        keep_ids=keep_ids,
     )
     y_np = y_np.astype(np.float32, copy=False)
     if covar_np is not None:
         covar_np = covar_np.astype(np.float32, copy=False)
 
     logger.info("Loaded %s samples; dropped %s", y_np.shape[0], len(dropped))
-
-    keep_path = args.keep_path
-    if keep_path and os.path.exists(keep_path):
-        keep_ids = read_keep_ids(keep_path)
-        keep_set = set(keep_ids)
-        fam_keep_set_before = set(fam_keep)
-        keep_mask = np.fromiter((iid in keep_set for iid in fam_keep), dtype=np.bool_, count=len(fam_keep))
-        if not bool(np.all(keep_mask)):
-            y_np = y_np[keep_mask]
-            if covar_np is not None:
-                covar_np = covar_np[keep_mask]
-            fam_keep = [iid for iid, keep in zip(fam_keep, keep_mask) if keep]
-        missing_keep = [iid for iid in keep_ids if iid not in fam_keep_set_before]
-        if missing_keep:
-            logger.warning("Warning: %s keep IDs missing phenotype/covar; e.g., %s", len(missing_keep), missing_keep[:5])
 
     # ---- PGEN direct read or BED sample-mask ---------------------------------
     sources = None

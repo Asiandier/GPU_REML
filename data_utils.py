@@ -264,6 +264,7 @@ def load_pheno_covar_aligned(
     pheno_path: str,
     covar_path: Optional[str] = None,
     add_intercept: bool = True,
+    keep_ids: Optional[list[str]] = None,
 ) -> tuple[np.ndarray, Optional[np.ndarray], list[str], list[str]]:
     """
     Align pheno/covar to FAM IID order and drop rows with missing or invalid pheno/covar after parsing/filtering.
@@ -272,7 +273,9 @@ def load_pheno_covar_aligned(
         y: (n_kept,) float32
         X: (n_kept, p) float32 or None
         keep_ids: list of kept IIDs in FAM order
-        dropped: list of IIDs dropped because phenotype/covariate data were missing or invalid after parsing/filtering
+        dropped: list of IIDs dropped because phenotype/covariate data were missing
+            or invalid after parsing/filtering, plus valid IIDs excluded by
+            keep_ids when provided.
     """
     fam_df = _read_fam_df(fam_path)
     pheno_df = _parse_pheno_df(pheno_path)
@@ -289,6 +292,13 @@ def load_pheno_covar_aligned(
 
     dropped_df = joined.filter(~valid_mask).select("iid")
     kept_df = joined.filter(valid_mask)
+    if keep_ids is not None:
+        keep_set = set(keep_ids)
+        keep_expr = pl.col("iid").is_in(list(keep_set))
+        extra_dropped_df = kept_df.filter(~keep_expr).select("iid")
+        if extra_dropped_df.height > 0:
+            dropped_df = pl.concat([dropped_df, extra_dropped_df], how="vertical")
+        kept_df = kept_df.filter(keep_expr)
 
     if kept_df.height == 0:
         raise ValueError(

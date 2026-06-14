@@ -100,25 +100,22 @@ def main():
         temp_fam_paths.append(fam_path)
         atexit.register(cleanup_path, fam_path)
 
-    keep_ids = read_keep_ids(args.keep_path) if args.keep_path else None
+    keep_ids = None
+    if args.keep_path and os.path.exists(args.keep_path):
+        keep_ids = read_keep_ids(args.keep_path)
     y_np, X_np, fam_keep, dropped = load_pheno_covar_aligned(
         fam_path=fam_path,
         pheno_path=args.pheno_txt,
         covar_path=args.covar_txt or None,
         add_intercept=True,
+        keep_ids=keep_ids,
     )
-    if keep_ids:
-        keep_set = set(keep_ids)
-        mask_keep = np.array([iid in keep_set for iid in fam_keep], dtype=bool)
-        y_np = y_np[mask_keep]
-        X_np = X_np[mask_keep] if X_np is not None else None
-        fam_keep = [iid for iid in fam_keep if iid in keep_set]
 
     if args.keep_out:
         os.makedirs(os.path.dirname(args.keep_out) or ".", exist_ok=True)
         with open(args.keep_out, "w") as f:
             for iid in fam_keep:
-                f.write(f"{iid}\n")
+                f.write(f"{iid} {iid}\n")
     if args.dropped_out:
         os.makedirs(os.path.dirname(args.dropped_out) or ".", exist_ok=True)
         with open(args.dropped_out, "w") as f:

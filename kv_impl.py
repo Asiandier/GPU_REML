@@ -126,6 +126,26 @@ def _kv_one_call_scaled_jit(
 
 
 @jax.jit
+def _kv_one_call_snp_weighted_jit(
+    g_dev_packed: Array,
+    true_width: Array,
+    means_call: Array,
+    inv_call: Array,
+    weights_call: Array,
+    V: Array,
+    miss_u8: Array,
+    acc: Array,
+) -> Array:
+    """Accumulate one call-block contribution with per-SNP kernel weights."""
+    diff, inv_f = _unpack_impute_center(
+        g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
+    inner = diff.T @ V
+    inv_sq = inv_f * inv_f
+    weighted_inv_sq = weights_call[: diff.shape[1]].astype(V.dtype) * inv_sq
+    return acc + diff @ (weighted_inv_sq[:, None] * inner)
+
+
+@jax.jit
 def _xtv_one_call_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
     true_width: Array,     # () int32
@@ -252,6 +272,59 @@ def kv_impl_streamed(
         eff = eff_m.astype(fp)
         acc = jax.lax.cond(eff > 0, lambda o: o / eff, lambda o: o, acc)
 
+    return acc[:, 0] if squeeze else acc
+
+
+def kv_impl_snp_weighted_streamed(
+    V: Array,
+    true_widths: Array,
+    means_by_call: Array,
+    inv_by_call: Array,
+    weights_by_call: Array,
+    denom: Array,
+    *,
+    n: int,
+    n_calls: int,
+    pop_block: Callable[[int], np.ndarray],
+    missing_val: int = 3,
+) -> Array:
+    """
+    Streaming ``Z diag(w) Z.T V / denom`` for one soft grouping component.
+
+    ``weights_by_call`` is padded to the streamer's unpack width; padding is
+    harmless because invalid columns have zero inverse standard deviation.
+    """
+    squeeze = V.ndim == 1
+    if squeeze:
+        V = V[:, None]
+
+    fp = V.dtype
+    dev = next(iter(V.devices()))
+    miss_u8 = jnp.asarray(np.uint8(missing_val), dtype=jnp.uint8)
+
+    acc = jnp.zeros((n, V.shape[1]), dtype=fp)
+    if n_calls == 0:
+        return acc[:, 0] if squeeze else acc
+
+    g_dev_next = _device_put_block(pop_block(0), dev)
+    for c in range(n_calls):
+        g_dev_cur = g_dev_next
+        if c + 1 < n_calls:
+            g_dev_next = _device_put_block(pop_block(c + 1), dev)
+        acc = _kv_one_call_snp_weighted_jit(
+            g_dev_cur,
+            true_widths[c],
+            means_by_call[c],
+            inv_by_call[c],
+            weights_by_call[c],
+            V,
+            miss_u8,
+            acc,
+        )
+        del g_dev_cur
+
+    denom = denom.astype(fp)
+    acc = acc / denom
     return acc[:, 0] if squeeze else acc
 
 

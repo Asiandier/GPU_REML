@@ -14,6 +14,10 @@ def configure_runtime_env() -> None:
     # project GPU budget more closely. Prefer the platform allocator so
     # nvidia-smi reflects live allocations more faithfully than the default
     # pooled allocator. Respect any explicit user override.
+    # Limit backend discovery to CUDA/CPU by default. On non-TPU machines JAX
+    # otherwise tries to initialize the TPU backend and emits a noisy libtpu
+    # warning during every CLI run.
+    os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 

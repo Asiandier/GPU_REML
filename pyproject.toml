@@ -26,6 +26,7 @@ dev = []
 gpu-reml = "GPU_REML.run_reml_pipeline:main"
 gpu-reml-sparse = "GPU_REML.run_sparse_reml_pipeline:main"
 gpu-reml-gwas = "GPU_REML.run_gwas_pipeline:main"
+gpu-reml-relax = "GPU_REML.run_relaxation_grouping:main"
 
 [tool.setuptools]
 packages = ["GPU_REML"]

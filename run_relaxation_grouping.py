@@ -66,12 +66,42 @@ def parse_args():
     p.add_argument("--call-width", type=int, default=int(env("CALL_WIDTH", "65536")))
     p.add_argument("--cpu-threads", type=int, default=int(env("CPU_THREADS", "0")))
     p.add_argument("--n-groups", type=int, required=True)
-    p.add_argument("--outer-iters", type=int, default=int(env("RELAX_OUTER_ITERS", "5")))
+    p.add_argument(
+        "--outer-iters",
+        type=int,
+        default=int(env("RELAX_OUTER_ITERS", "5")),
+        help="Maximum number of outer theta-update iterations.",
+    )
     p.add_argument("--theta-lr", type=float, default=float(env("RELAX_THETA_LR", "1e-3")))
     p.add_argument("--theta-init-npy", default=env("RELAX_THETA_INIT_NPY", ""))
-    p.add_argument("--theta-init", choices=["random", "uniform"], default=env("RELAX_THETA_INIT", "random"))
-    p.add_argument("--theta-random-low", type=float, default=float(env("RELAX_THETA_RANDOM_LOW", "0.0")))
-    p.add_argument("--theta-random-high", type=float, default=float(env("RELAX_THETA_RANDOM_HIGH", "1.0")))
+    p.add_argument(
+        "--theta-init",
+        choices=["random", "uniform"],
+        default=env("RELAX_THETA_INIT", "random"),
+    )
+    p.add_argument(
+        "--theta-random-low",
+        type=float,
+        default=float(env("RELAX_THETA_RANDOM_LOW", "0.0")),
+    )
+    p.add_argument(
+        "--theta-random-high",
+        type=float,
+        default=float(env("RELAX_THETA_RANDOM_HIGH", "1.0")),
+    )
+    p.add_argument(
+        "--theta-linesearch-trials",
+        type=int,
+        default=int(env("RELAX_THETA_LINESEARCH_TRIALS", "3")),
+        help="Maximum number of consecutive half-step theta proposals to evaluate before stopping.",
+    )
+    p.add_argument(
+        "--reml-log-detail",
+        choices=["off", "compact", "full"],
+        default=env("RELAX_REML_LOG_DETAIL", "compact"),
+        help="Control inner REML logs printed inside each relaxation outer/candidate fit.",
+    )
+    p.add_argument("--reml-verbose", action="store_true", help="Alias for --reml-log-detail full.")
     p.add_argument("--n-rand-vec", type=int, default=int(env("N_RAND_VEC", "32")))
     p.add_argument("--max-pcg-iters", type=int, default=int(env("MAX_PCG_ITERS", "400")))
     p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "20")))
@@ -80,8 +110,11 @@ def parse_args():
     p.add_argument("--h2-init", type=float, default=float(env("H2_INIT", "0.5")))
     p.add_argument("--pcg-tol", type=float, default=float(env("RELAX_PCG_TOL", "1e-3")))
     p.add_argument("--seed", type=int, default=int(env("SEED", "0")))
-    p.add_argument("--no-final-refit", action="store_true")
-    p.add_argument("--verbose", action="store_true", default=env("VERBOSE", "1").lower() not in {"0", "false", "no"})
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        default=env("VERBOSE", "1").lower() not in {"0", "false", "no"},
+    )
     return p.parse_args()
 
 
@@ -146,7 +179,11 @@ def main():
         raise SystemExit("Specify exactly one of --bed-prefix or --pgen-prefix.")
     if not args.pheno_txt:
         raise SystemExit("--pheno-txt is required.")
-    fam_path = make_nonbed_input_fam(pgen_prefix=pgen_prefix) if pgen_prefix else bed_prefix + ".fam"
+    fam_path = (
+        make_nonbed_input_fam(pgen_prefix=pgen_prefix)
+        if pgen_prefix
+        else bed_prefix + ".fam"
+    )
     keep_ids = read_keep_ids(args.keep_path) if args.keep_path else None
     y_np, X_np, fam_keep, dropped, _ = load_pheno_covar_aligned_with_transform(
         fam_path,
@@ -172,9 +209,11 @@ def main():
         )
 
     n_covar = int(X_np.shape[1]) if X_np is not None else 0
+    reml_log_detail = "full" if args.reml_verbose else args.reml_log_detail
     logger.info(
-        "relaxation_grouping: n_groups=%d outer_iters=%d theta_lr=%.6g seed=%d "
-        "n_rand_vec=%d slq_samples=%d slq_m=%d minq_iter=%d final_refit=%s",
+        "relaxation_grouping: n_groups=%d max_outer_iters=%d theta_lr=%.6g seed=%d "
+        "n_rand_vec=%d slq_samples=%d slq_m=%d minq_iter=%d theta_linesearch_trials=%d "
+        "reml_log_detail=%s",
         int(args.n_groups),
         int(args.outer_iters),
         float(args.theta_lr),
@@ -183,7 +222,8 @@ def main():
         int(args.slq_samples),
         int(args.slq_m),
         int(args.minq_iter),
-        "no" if args.no_final_refit else "yes",
+        int(args.theta_linesearch_trials),
+        reml_log_detail,
     )
     logger.info(
         "genotype: m=%d n=%d call_width=%d device=%s n_covar=%d",
@@ -207,8 +247,10 @@ def main():
         slq_samples=int(args.slq_samples),
         slq_m=int(args.slq_m),
         pcg_tol=float(args.pcg_tol),
+        theta_linesearch_trials=int(args.theta_linesearch_trials),
         verbose=bool(args.verbose),
-        refit_final=not bool(args.no_final_refit),
+        reml_verbose=reml_log_detail != "off",
+        reml_log_detail="compact" if reml_log_detail == "off" else reml_log_detail,
     )
     result = run_relaxation_grouping(
         streamer=streamer,
@@ -217,7 +259,11 @@ def main():
         theta_init=theta0,
         cfg=cfg,
     )
-    logger.info("fit done @ %s, elapsed=%.1fs", time.strftime("%Y-%m-%dT%H:%M:%S"), time.time() - t0)
+    logger.info(
+        "fit done @ %s, elapsed=%.1fs",
+        time.strftime("%Y-%m-%dT%H:%M:%S"),
+        time.time() - t0,
+    )
     paths = write_relaxation_outputs(
         out_prefix=args.out_prefix,
         result=result,
@@ -229,26 +275,21 @@ def main():
         total = float(np.sum(vc))
         if total > 0:
             print(f"h2: {float(np.sum(vc[:-1]) / total):.6f}")
-    for row in result.history:
-        outer = row.get("outer_iter")
-        ll = row.get("loglik", float("nan"))
-        step = row.get("theta_step_norm", float("nan"))
-        grad = row.get("theta_grad_norm", float("nan"))
-        tmin = row.get("theta_min", float("nan"))
-        tmax = row.get("theta_max", float("nan"))
-        stop = row.get("reml_stop_reason", "")
-        print(
-            f"  outer {outer}: ll={float(ll):.4g} theta_step={float(step):.3e} "
-            f"theta_grad={float(grad):.3e} theta=[{float(tmin):.3e}, {float(tmax):.3e}] "
-            f"reml_stop={stop}"
-        )
-    if args.no_final_refit:
-        print(
-            "note: --no-final-refit was used; var_components are from the last REML "
-            "before the final theta update."
-        )
-    else:
-        print("note: final refit completed; var_components correspond to the written theta.")
+    outer_rows = [row for row in result.history if isinstance(row.get("outer_iter"), int)]
+    proposal_rows = [row for row in outer_rows if int(row.get("theta_proposal_trial", 0)) > 0]
+    accepted_updates = sum(
+        1
+        for row in proposal_rows
+        if bool(row.get("theta_update_accepted", False))
+    )
+    final_ll = (
+        float(result.history[-1].get("accepted_loglik", float("nan")))
+        if result.history
+        else float("nan")
+    )
+    print(f"accepted_theta_updates: {accepted_updates}/{len(proposal_rows)}")
+    print(f"final_loglik: {final_ll:.10g}")
+    print("note: final outputs are the best accepted outer state.")
     print("theta:", paths["theta"])
     print("theta_grad:", paths["theta_grad"])
     print("history:", paths["history"])

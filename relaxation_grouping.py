@@ -33,8 +33,10 @@ class RelaxationConfig:
     slq_samples: int = 4
     slq_m: int = 8
     pcg_tol: float = 1e-3
+    theta_linesearch_trials: int = 3
     verbose: bool = True
-    refit_final: bool = True
+    reml_verbose: bool = True
+    reml_log_detail: str = "compact"
 
 
 @dataclasses.dataclass
@@ -76,7 +78,8 @@ class SoftGroupingOperator:
             raise ValueError(f"theta must be a 2D array with shape (m, G), got {theta_np.shape}.")
         if int(theta_np.shape[0]) != int(streamer.m):
             raise ValueError(
-                f"theta SNP dimension mismatch: expected m={int(streamer.m)}, got {theta_np.shape[0]}."
+                "theta SNP dimension mismatch: "
+                f"expected m={int(streamer.m)}, got {theta_np.shape[0]}."
             )
         if theta_np.shape[1] <= 0:
             raise ValueError("theta must contain at least one group.")
@@ -84,7 +87,9 @@ class SoftGroupingOperator:
             raise ValueError("theta contains non-finite values.")
         denom_np = np.sum(theta_np, axis=0, dtype=np.float64).astype(np.float32)
         if np.any(denom_np == 0.0):
-            raise ZeroDivisionError("At least one soft-group denominator sum_i theta_ik is exactly zero.")
+            raise ZeroDivisionError(
+                "At least one soft-group denominator sum_i theta_ik is exactly zero."
+            )
 
         self.streamer = streamer
         self.theta = jax.device_put(jnp.asarray(theta_np, dtype=jnp.float32), streamer.dev)
@@ -97,7 +102,9 @@ class SoftGroupingOperator:
 
     def kv(self, component_idx: int, V: jnp.ndarray) -> jnp.ndarray:
         if component_idx < 0 or component_idx >= self.n_groups:
-            raise IndexError(f"component_idx={component_idx} out of range for {self.n_groups} groups.")
+            raise IndexError(
+                f"component_idx={component_idx} out of range for {self.n_groups} groups."
+            )
         self.streamer._prepare_kv_pass()
         V = _ensure_on_device(V, self.streamer.dev)
         return kv_impl_snp_weighted_streamed(
@@ -134,7 +141,10 @@ class SoftGroupingOperator:
         return acc[:, 0] if squeeze else acc
 
     def diag_list(self) -> tuple[jnp.ndarray, ...]:
-        diag_one = jax.device_put(jnp.ones((int(self.streamer.n),), dtype=jnp.float32), self.streamer.dev)
+        diag_one = jax.device_put(
+            jnp.ones((int(self.streamer.n),), dtype=jnp.float32),
+            self.streamer.dev,
+        )
         return tuple(diag_one for _ in range(self.n_groups))
 
 
@@ -184,7 +194,8 @@ def compute_soft_grouping_gradient(
     theta_vc = jnp.asarray(var_components, dtype=jnp.float32).reshape(-1)
     if int(theta_vc.shape[0]) != op.n_groups + 1:
         raise ValueError(
-            f"var_components length mismatch: expected {op.n_groups + 1}, got {int(theta_vc.shape[0])}."
+            "var_components length mismatch: "
+            f"expected {op.n_groups + 1}, got {int(theta_vc.shape[0])}."
         )
     theta_g = theta_vc[:-1]
     theta_e = theta_vc[-1]
@@ -294,14 +305,33 @@ def initialize_theta(
     if mode != "random":
         raise ValueError("theta initialization mode must be 'random' or 'uniform'.")
     rng = np.random.default_rng(int(seed))
-    theta = rng.uniform(float(random_low), float(random_high), size=(int(m), int(n_groups))).astype(np.float32)
+    theta = rng.uniform(
+        float(random_low),
+        float(random_high),
+        size=(int(m), int(n_groups)),
+    ).astype(np.float32)
     return theta / np.sum(theta, axis=1, keepdims=True)
 
 
-def constrained_theta_update(theta: jnp.ndarray, theta_grad: jnp.ndarray, theta_lr: float) -> jnp.ndarray:
+def constrained_theta_update(
+    theta: jnp.ndarray,
+    theta_grad: jnp.ndarray,
+    theta_lr: float,
+) -> jnp.ndarray:
     """Exponentiated-gradient update that preserves per-SNP simplex constraints."""
     numer = theta * jnp.exp(float(theta_lr) * theta_grad)
     return numer / jnp.sum(numer, axis=1, keepdims=True)
+
+
+def _h2_from_vc(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    total = float(np.sum(arr))
+    return float(np.sum(arr[:-1]) / total) if arr.size >= 2 and total > 0.0 else float("nan")
+
+
+def _format_vc(values: np.ndarray) -> str:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return "[" + ", ".join(f"{float(v):.3e}" for v in arr) + "]"
 
 
 def run_relaxation_grouping(
@@ -314,32 +344,53 @@ def run_relaxation_grouping(
 ) -> RelaxationResult:
     theta = jnp.asarray(theta_init, dtype=jnp.float32)
     if int(theta.shape[1]) != int(cfg.n_groups):
-        raise ValueError(f"theta_init group mismatch: expected {cfg.n_groups}, got {int(theta.shape[1])}.")
+        raise ValueError(
+            f"theta_init group mismatch: expected {cfg.n_groups}, got {int(theta.shape[1])}."
+        )
 
     history: list[dict[str, object]] = []
     var_components_init = None
-    last_vc = None
-    last_grad = jnp.zeros_like(theta)
+    accepted_theta = theta
+    accepted_vc = None
+    accepted_grad = jnp.zeros_like(theta)
+    accepted_loglik: float | None = None
+    consecutive_rejections = 0
+    proposal_scale = 0.0
+    proposal_trial = 0
 
     n_updates = max(0, int(cfg.outer_iters))
+    reject_patience = max(1, int(cfg.theta_linesearch_trials))
     for outer in range(n_updates):
         iter_t0 = time.time()
+        reml_seed = int(cfg.seed)
+        current_proposal_scale = float(proposal_scale)
+        current_proposal_trial = int(proposal_trial)
         if cfg.verbose:
             logger.info(
-                "[relaxation] outer %d/%d REML start @ %s",
+                "[relaxation] outer %d/%d evaluate current theta @ %s%s",
                 outer + 1,
                 n_updates,
                 datetime.now().isoformat(timespec="seconds"),
+                ""
+                if accepted_loglik is None
+                else (
+                    f" accepted_best_ll={accepted_loglik:.6e} "
+                    f"proposal_scale={current_proposal_scale:.3e}"
+                ),
             )
         op = SoftGroupingOperator(streamer, theta)
+        k_mvs = tuple(
+            lambda V, g_idx=g_idx, op=op: op.kv(g_idx, V)
+            for g_idx in range(op.n_groups)
+        )
         vc, reml_history, diagnostics = fit_reml(
             y=jnp.asarray(y, dtype=jnp.float32),
-            K_mvs=tuple(lambda V, g_idx=g_idx, op=op: op.kv(g_idx, V) for g_idx in range(op.n_groups)),
+            K_mvs=k_mvs,
             diag_list=op.diag_list(),
             covar=jnp.asarray(covar, dtype=jnp.float32) if covar is not None else None,
             n_rand_vec=int(cfg.n_rand_vec),
             maxiter=int(cfg.max_pcg_iters),
-            seed=int(cfg.seed) + outer * 1009,
+            seed=reml_seed,
             h2_init=float(cfg.h2_init),
             param_init=var_components_init,
             minq_iter=int(cfg.minq_iter),
@@ -351,8 +402,12 @@ def run_relaxation_grouping(
             weighted_hv=op.weighted_hv,
             stacked_kv=op.stacked_kv,
             return_diagnostics=True,
-            verbose=bool(cfg.verbose),
+            verbose=bool(cfg.reml_verbose),
+            log_detail=str(cfg.reml_log_detail),
         )
+        current_loglik = float(jax.device_get(diagnostics["loglik"]))
+        previous_best = current_loglik if accepted_loglik is None else accepted_loglik
+        accepted = accepted_loglik is None or current_loglik >= accepted_loglik
         grad_info = compute_soft_grouping_gradient(
             streamer=streamer,
             op=op,
@@ -360,20 +415,73 @@ def run_relaxation_grouping(
             covar=jnp.asarray(covar, dtype=jnp.float32) if covar is not None else None,
             var_components=vc,
             n_rand_vec=int(cfg.n_rand_vec),
-            seed=int(cfg.seed) + outer * 1009,
+            seed=reml_seed,
             max_pcg_iters=int(cfg.max_pcg_iters),
             pcg_tol=float(cfg.pcg_tol),
-        )
-        last_vc = vc
-        last_grad = grad_info.theta_grad
-        theta_next = constrained_theta_update(theta, last_grad, float(cfg.theta_lr))
-        step = theta_next - theta
-        theta_host, grad_host, step_host, vc_host = jax.device_get(
-            (theta_next, last_grad, step, vc)
+        ) if accepted else None
+
+        delta_vs_best = current_loglik - previous_best
+        if accepted:
+            accepted_theta_prev = accepted_theta
+            accepted_theta = theta
+            accepted_vc = vc
+            accepted_loglik = current_loglik
+            accepted_grad = grad_info.theta_grad
+            var_components_init = jnp.asarray(accepted_vc, dtype=jnp.float32)
+            consecutive_rejections = 0
+            proposal_scale = 1.0
+            proposal_trial = 1
+            theta_next = constrained_theta_update(
+                accepted_theta,
+                accepted_grad,
+                float(cfg.theta_lr) * proposal_scale,
+            )
+            decision = "accept current theta; gradient computed and next theta proposed"
+            step = accepted_theta - accepted_theta_prev if outer > 0 else jnp.zeros_like(theta)
+            row_vc = vc
+            row_grad = accepted_grad
+            row_reml_history = reml_history
+        else:
+            consecutive_rejections += 1
+            decision = "reject current theta; next outer will test a smaller step"
+            step = theta - accepted_theta
+            row_vc = vc
+            row_grad = accepted_grad
+            row_reml_history = reml_history
+            if consecutive_rejections >= reject_patience:
+                theta_next = accepted_theta
+            else:
+                proposal_trial = consecutive_rejections + 1
+                proposal_scale = 0.5 ** consecutive_rejections
+                theta_next = constrained_theta_update(
+                    accepted_theta,
+                    accepted_grad,
+                    float(cfg.theta_lr) * proposal_scale,
+                )
+
+        theta_host, grad_host, step_host, vc_host, accepted_vc_host = jax.device_get(
+            (
+                theta,
+                row_grad,
+                step,
+                row_vc,
+                accepted_vc if accepted_vc is not None else vc,
+            )
         )
         hist_row = {
             "outer_iter": outer + 1,
-            "loglik": float(jax.device_get(diagnostics["loglik"])),
+            "loglik": float(current_loglik),
+            "evaluated_loglik": float(current_loglik),
+            "accepted_loglik": float(accepted_loglik),
+            "previous_accepted_loglik": float(previous_best),
+            "delta_vs_best": float(delta_vs_best),
+            "theta_state_accepted": bool(accepted),
+            "theta_update_accepted": bool(accepted and current_proposal_trial > 0),
+            "theta_linesearch_accepted": bool(accepted),
+            "theta_proposal_scale": float(current_proposal_scale),
+            "theta_proposal_trial": int(current_proposal_trial),
+            "theta_reject_streak": int(consecutive_rejections),
+            "outer_stop_reason": "",
             "theta_grad_norm": float(np.linalg.norm(np.asarray(grad_host).reshape(-1))),
             "theta_step_norm": float(np.linalg.norm(np.asarray(step_host).reshape(-1))),
             "theta_min": float(np.min(theta_host)),
@@ -383,86 +491,58 @@ def run_relaxation_grouping(
             "denom_min": float(np.min(np.sum(theta_host, axis=0))),
             "denom_max": float(np.max(np.sum(theta_host, axis=0))),
             "var_components": [float(x) for x in np.asarray(vc_host).reshape(-1)],
+            "accepted_var_components": [float(x) for x in np.asarray(accepted_vc_host).reshape(-1)],
             "reml_stop_reason": str(diagnostics.get("stop_reason", "")),
-            "reml_iters": int(len(reml_history)),
-            "gradient_pcg_iters": int(grad_info.pcg_iters),
+            "reml_iters": int(len(row_reml_history)),
+            "gradient_pcg_iters": int(grad_info.pcg_iters) if grad_info is not None else 0,
             "elapsed_sec": float(time.time() - iter_t0),
         }
         history.append(hist_row)
         if cfg.verbose:
             logger.info(
-                "[relaxation] outer %d done ll=%.6e grad=%.3e step=%.3e theta=[%.3e, %.3e]",
+                "[relaxation] outer %d result: evaluated_ll=%.6e "
+                "delta_vs_accepted=%+.3e %s",
                 outer + 1,
                 hist_row["loglik"],
-                hist_row["theta_grad_norm"],
+                hist_row["delta_vs_best"],
+                decision,
+            )
+            logger.info(
+                "[relaxation] outer %d summary: proposal_scale=%.3e "
+                "theta_step_norm=%.3e grad_norm=%.3e h2=%.6f",
+                outer + 1,
+                hist_row["theta_proposal_scale"],
                 hist_row["theta_step_norm"],
+                hist_row["theta_grad_norm"],
+                _h2_from_vc(vc_host),
+            )
+            logger.info(
+                "[relaxation] outer %d vc=%s theta_range=[%.3e, %.3e]",
+                outer + 1,
+                _format_vc(vc_host),
                 hist_row["theta_min"],
                 hist_row["theta_max"],
             )
+        if not accepted and consecutive_rejections >= reject_patience:
+            hist_row["outer_stop_reason"] = "theta_line_search_rejected"
+            if cfg.verbose:
+                logger.info(
+                    "[relaxation] stop outer loop: %d consecutive rejected theta proposal(s); "
+                    "theta_linesearch_trials=%d max_outer=%d",
+                    consecutive_rejections,
+                    reject_patience,
+                    n_updates,
+                )
+            break
         theta = jnp.asarray(theta_next, dtype=jnp.float32)
-        var_components_init = jnp.asarray(vc, dtype=jnp.float32)
 
-    if cfg.refit_final:
-        op = SoftGroupingOperator(streamer, theta)
-        vc, _, diagnostics = fit_reml(
-            y=jnp.asarray(y, dtype=jnp.float32),
-            K_mvs=tuple(lambda V, g_idx=g_idx, op=op: op.kv(g_idx, V) for g_idx in range(op.n_groups)),
-            diag_list=op.diag_list(),
-            covar=jnp.asarray(covar, dtype=jnp.float32) if covar is not None else None,
-            n_rand_vec=int(cfg.n_rand_vec),
-            maxiter=int(cfg.max_pcg_iters),
-            seed=int(cfg.seed) + 99991,
-            h2_init=float(cfg.h2_init),
-            param_init=var_components_init,
-            minq_iter=int(cfg.minq_iter),
-            slq_samples=int(cfg.slq_samples),
-            slq_m=int(cfg.slq_m),
-            slq_mode="raw",
-            precond_conf=None,
-            precond_eps=1e-6,
-            weighted_hv=op.weighted_hv,
-            stacked_kv=op.stacked_kv,
-            return_diagnostics=True,
-            verbose=bool(cfg.verbose),
-        )
-        grad_info = compute_soft_grouping_gradient(
-            streamer=streamer,
-            op=op,
-            y=jnp.asarray(y, dtype=jnp.float32),
-            covar=jnp.asarray(covar, dtype=jnp.float32) if covar is not None else None,
-            var_components=vc,
-            n_rand_vec=int(cfg.n_rand_vec),
-            seed=int(cfg.seed) + 99991,
-            max_pcg_iters=int(cfg.max_pcg_iters),
-            pcg_tol=float(cfg.pcg_tol),
-        )
-        last_vc = vc
-        last_grad = grad_info.theta_grad
-        history.append(
-            {
-                "outer_iter": "final_refit",
-                "loglik": float(jax.device_get(diagnostics["loglik"])),
-                "theta_grad_norm": float(np.linalg.norm(np.asarray(jax.device_get(last_grad)).reshape(-1))),
-                "theta_step_norm": 0.0,
-                "theta_min": float(np.min(np.asarray(jax.device_get(theta)))),
-                "theta_max": float(np.max(np.asarray(jax.device_get(theta)))),
-                "theta_row_sum_min": float(np.min(np.sum(np.asarray(jax.device_get(theta)), axis=1))),
-                "theta_row_sum_max": float(np.max(np.sum(np.asarray(jax.device_get(theta)), axis=1))),
-                "denom_min": float(np.min(np.sum(np.asarray(jax.device_get(theta)), axis=0))),
-                "denom_max": float(np.max(np.sum(np.asarray(jax.device_get(theta)), axis=0))),
-                "var_components": [float(x) for x in np.asarray(jax.device_get(vc)).reshape(-1)],
-                "reml_stop_reason": str(diagnostics.get("stop_reason", "")),
-                "gradient_pcg_iters": int(grad_info.pcg_iters),
-            }
-        )
-
-    if last_vc is None:
-        raise RuntimeError("No REML fit was run; set outer_iters > 0 or refit_final=True.")
+    if accepted_vc is None:
+        raise RuntimeError("No REML fit was run; set outer_iters > 0.")
 
     return RelaxationResult(
-        theta=theta,
-        var_components=jnp.asarray(last_vc, dtype=jnp.float32),
-        theta_grad=jnp.asarray(last_grad, dtype=jnp.float32),
+        theta=accepted_theta,
+        var_components=jnp.asarray(accepted_vc, dtype=jnp.float32),
+        theta_grad=jnp.asarray(accepted_grad, dtype=jnp.float32),
         history=history,
     )
 
@@ -490,7 +570,12 @@ def write_relaxation_outputs(
                 "method": "simplex_constrained_soft_grouping_exponentiated_gradient_ascent",
                 "n_groups": int(config.n_groups),
                 "outer_iters": int(config.outer_iters),
+                "max_outer_iters": int(config.outer_iters),
                 "theta_lr": float(config.theta_lr),
+                "theta_linesearch_trials": int(config.theta_linesearch_trials),
+                "reml_verbose": bool(config.reml_verbose),
+                "reml_log_detail": str(config.reml_log_detail),
+                "seed_policy": "fixed_across_outer",
                 "n_rand_vec": int(config.n_rand_vec),
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "outputs": {

@@ -828,6 +828,7 @@ def fit_reml(
     early_pcg_tol: float = 5e-3,
     default_pcg_tol: float = 1e-3,
     verbose: bool = True,
+    log_detail: str = "full",
     return_diagnostics: bool = False,
 ):
     """Fit single-trait Gaussian REML with AI/Fisher updates.
@@ -859,6 +860,8 @@ def fit_reml(
         raise ValueError("genetic_zero_tol must be >= 0.")
     if max_linesearch_trials < 1:
         raise ValueError("max_linesearch_trials must be >= 1.")
+    if log_detail not in {"compact", "full"}:
+        raise ValueError("log_detail must be 'compact' or 'full'.")
     if optimizer not in {"strict", "smile_scoring"}:
         raise ValueError("optimizer must be 'strict' or 'smile_scoring'.")
     if scoring_step_tol < 0.0:
@@ -870,6 +873,8 @@ def fit_reml(
     if warmup_pcg_tol <= 0.0 or early_pcg_tol <= 0.0 or default_pcg_tol <= 0.0:
         raise ValueError("PCG tolerances must be > 0.")
     _t0 = time.time()
+    full_log = bool(verbose) and log_detail == "full"
+    compact_log = bool(verbose) and log_detail == "compact"
     if verbose:
         logger.info(
             "[REML] start @ %s n=%d G=%d n_rand_vec=%d slq_samples=%d slq_mode=%s",
@@ -924,14 +929,14 @@ def fit_reml(
     # These cached probe responses are reused for:
     #   1) Taylor logdet trace estimates tr(H^{-1} K_i)
     #   2) direct Hutchinson score traces tr(P K_i)
-    if verbose:
+    if full_log:
         _t_kv_cache = time.time()
         logger.info("[REML] precompute K_i @ Vrand (%d kv passes) ...", G)
     if stacked_kv is not None:
         KVrand_stack = stacked_kv(Vrand_fixed)
     else:
         KVrand_stack = jnp.stack([mv(Vrand_fixed) for mv in K_mvs], axis=0)
-    if verbose:
+    if full_log:
         logger.info("[REML] K_i @ Vrand done elapsed=%.1fs", time.time() - _t_kv_cache)
 
     # ---- Cache constant RHS [X | y | Vrand] once ---------------------------
@@ -982,7 +987,7 @@ def fit_reml(
     warm_ready    = False       # Python flag — avoids GPU→CPU sync on NaN check
     warm_ai_ready = False
 
-    if verbose:
+    if full_log:
         logger.info(
             "[REML] warm shapes: n_XyZ=%d n_warm=%d n_rand_vec=%d n_covar=%d",
             n_XyZ_cols, n_warm_cols, n_rand_vec,
@@ -1021,7 +1026,7 @@ def fit_reml(
         return result
 
     # Warmup
-    if verbose:
+    if full_log:
         _t_eval = time.time()
         logger.info("[REML] warmup eval @ %s", datetime.now().isoformat(timespec='seconds'))
     ll, grad, FI, k_pcg0, warm_all, warm_ai, tr_Hinv_cached, tr_Hinv_K_cached, logdet_cached = _run_eval(
@@ -1036,9 +1041,13 @@ def fit_reml(
     )
     if not bool(jnp.isfinite(ll) and jnp.all(jnp.isfinite(grad)) and fi_finite):
         raise FloatingPointError("Non-finite warmup state (ll/grad/FI).")
-    if verbose:
+    if full_log:
         ai_pcg0 = int(FI.stats.ai_pcg_iters) if isinstance(FI, AverageInfoMatrix) and FI.stats is not None else 0
         logger.info("[REML] warmup done elapsed=%.1fs pcg=%d ai_pcg=%d", time.time() - _t_eval, int(k_pcg0), ai_pcg0)
+    elif compact_log:
+        ll0_host = float(jax.device_get(ll))
+        ai_pcg0 = int(FI.stats.ai_pcg_iters) if isinstance(FI, AverageInfoMatrix) and FI.stats is not None else 0
+        logger.info("[REML] warmup: ll=%.6e pcg=%d ai_pcg=%d", ll0_host, int(k_pcg0), ai_pcg0)
 
     stop_reason = "max_iter"
     history: list[dict] = []
@@ -1049,7 +1058,7 @@ def fit_reml(
         trial_count = 0
 
         def _log_workset_resolve(info: dict[str, object]) -> None:
-            if not verbose:
+            if not full_log:
                 return
             if trial_count <= 1:
                 logger.info(
@@ -1150,7 +1159,7 @@ def fit_reml(
                 trial_use_taylor = True
 
             if precond_refresh_fn is not None and precond_refresh_reldp > 0.0:
-                if verbose:
+                if full_log:
                     logger.info(
                         "[REML] iter %d refresh projected_core preconditioner "
                         "(trial=%d alpha=%.3e)",
@@ -1262,7 +1271,7 @@ def fit_reml(
             **step_fisher_stats_dict,
         })
 
-        if verbose:
+        if full_log:
             slq_tag = "taylor" if use_taylor else "slq"
             step_ai_pcg = int(step_fisher_stats_dict.get("ai_pcg_iters", 0))
             ws_resolves = int(step_fisher_stats_dict.get("ws_resolve_count", 0))
@@ -1289,6 +1298,29 @@ def fit_reml(
                 step_free_dim, step_frozen, ws_resolves, ws_fixed_total, ws_trace if ws_trace else "<none>",
                 step_ai_pcg, k_pcg, eval_ai_pcg, slq_tag, eval_elapsed, time.time() - iter_t0,
                 dparam_str,
+            )
+        elif compact_log:
+            step_ai_pcg = int(step_fisher_stats_dict.get("ai_pcg_iters", 0))
+            ls_text = ""
+            if trial_count > 1:
+                ls_text = " ls_trace=" + " -> ".join(
+                    f"a={alpha:.3g},dll={dll_i:+.2e}{'*' if ok else ''}"
+                    for alpha, dll_i, ok, _pcg_i, _ai_pcg_i, _taylor_i in ls_trace
+                )
+            logger.info(
+                "[REML] iter %d/%d %s ll=%.6e dll=%+.3e alpha=%.3e ls=%d pcg=%d ai_pcg=%d step=%.3e dp=%s%s",
+                it + 1,
+                minq_iter,
+                status,
+                float(ll_new_host),
+                dll,
+                alpha_used,
+                trial_count,
+                k_pcg,
+                eval_ai_pcg,
+                step_norm,
+                dparam_str,
+                ls_text,
             )
 
         if accepted:

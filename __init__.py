@@ -41,6 +41,7 @@ _EXPORTS: dict[str, str] = {
     "RelaxationConfig": ".relaxation_grouping",
     "RelaxationResult": ".relaxation_grouping",
     "SoftGroupingOperator": ".relaxation_grouping",
+    "constrained_theta_update": ".relaxation_grouping",
     "compute_soft_grouping_gradient": ".relaxation_grouping",
     "initialize_theta": ".relaxation_grouping",
     "run_relaxation_grouping": ".relaxation_grouping",

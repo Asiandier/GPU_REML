@@ -46,6 +46,8 @@ class FitConfig:
     smile_w_device_cache_bytes: float | None = None
     smile_optimizer: str = "strict"
     smile_scoring_step_tol: float = 1e-4
+    admix_weights: np.ndarray | None = None
+    admix_component_names: Sequence[str] | None = None
     standardization_overrides: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
     sample_mask: np.ndarray | None = None  # bool mask for sample subsetting
     call_width: int = 131072
@@ -281,11 +283,14 @@ class InfinitesimalREMLFitter:
         self._partitioned_streamer = None
         self._smile_operator = None
         self._smile_operators = ()
+        self._admix_sqrt_weights = None
+        self._admix_component_names: tuple[str, ...] = ()
         cpu_threads = _available_cpu_threads(cfg.cpu_threads)
         use_component_partition = (
             cfg.vc_block_sizes is not None
             or cfg.component_variant_indices is not None
         )
+        use_admixed = cfg.admix_weights is not None
         smile_w_files_present = cfg.smile_w_files is not None and len(cfg.smile_w_files) > 0
         smile_w_file_groups_present = (
             cfg.smile_w_file_groups is not None and len(cfg.smile_w_file_groups) > 0
@@ -344,6 +349,12 @@ class InfinitesimalREMLFitter:
             raise ValueError("SMILE block-W mode cannot be combined with component partitioning.")
         if use_smile and (cfg.rare_sources is not None or cfg.rare_bed_prefix):
             raise ValueError("SMILE block-W mode is currently supported only for dense-only fits.")
+        if use_admixed and use_smile:
+            raise ValueError("Admixed covariance mode cannot be combined with SMILE block-W mode.")
+        if use_admixed and use_component_partition:
+            raise ValueError("Admixed covariance mode cannot be combined with component partitioning.")
+        if use_admixed and (cfg.rare_sources is not None or cfg.rare_bed_prefix):
+            raise ValueError("Admixed covariance mode is currently supported only for dense-only fits.")
 
         if use_component_partition:
             if cfg.rare_sources is not None or cfg.rare_bed_prefix:
@@ -354,6 +365,8 @@ class InfinitesimalREMLFitter:
         if cfg.sources is not None:
             # ---- Source-based path (PGEN / any GenoBlockSource) ----
             sources = list(cfg.sources)
+            if use_admixed and len(sources) != 1:
+                raise ValueError("Admixed covariance mode requires exactly one dense source.")
             if use_component_partition and len(sources) != 1:
                 raise ValueError("single-source component partitioning requires exactly one dense source.")
             if dense_standardization_overrides is not None and len(dense_standardization_overrides) != len(sources):
@@ -388,6 +401,8 @@ class InfinitesimalREMLFitter:
         else:
             # ---- BED-prefix path (backward compatible) --------------------
             prefixes = cfg.bed_prefix if isinstance(cfg.bed_prefix, (list, tuple)) else [cfg.bed_prefix]
+            if use_admixed and len(prefixes) != 1:
+                raise ValueError("Admixed covariance mode requires exactly one dense BED prefix.")
             if use_component_partition and len(prefixes) != 1:
                 raise ValueError("single-source component partitioning requires exactly one dense BED prefix.")
             if dense_standardization_overrides is not None and len(dense_standardization_overrides) != len(prefixes):
@@ -424,6 +439,30 @@ class InfinitesimalREMLFitter:
         self._n_dense_streamers = n_dense
         if use_component_partition and self.streamers:
             self._partitioned_streamer = self.streamers[0]
+        if use_admixed:
+            if n_dense != 1 or not self.streamers:
+                raise ValueError("Admixed covariance mode requires exactly one dense genotype streamer.")
+            weights = np.asarray(cfg.admix_weights, dtype=np.float32)
+            if weights.ndim != 2 or weights.shape[0] != int(self.streamers[0].n) or weights.shape[1] == 0:
+                raise ValueError(
+                    "admix_weights must have shape (n_samples_after_alignment, n_ancestry_components); "
+                    f"got {weights.shape}, expected first dimension {int(self.streamers[0].n)}."
+                )
+            if not np.isfinite(weights).all() or np.any(weights < -1e-6):
+                raise ValueError("admix_weights must contain finite nonnegative ancestry proportions.")
+            weights = np.maximum(weights, 0.0).astype(np.float32, copy=False)
+            self._admix_sqrt_weights = jax.device_put(jnp.sqrt(jnp.asarray(weights)), self.streamers[0].dev)
+            if cfg.admix_component_names is None:
+                self._admix_component_names = tuple(
+                    f"admix_{idx:03d}" for idx in range(int(weights.shape[1]))
+                )
+            else:
+                names = tuple(str(name) for name in cfg.admix_component_names)
+                if len(names) != int(weights.shape[1]):
+                    raise ValueError(
+                        f"admix_component_names length mismatch: expected {int(weights.shape[1])}, got {len(names)}."
+                    )
+                self._admix_component_names = names
         if cfg.rare_sources is not None:
             from .sparse_stream import SparseGenoBlockStreamer
             rare_srcs = list(cfg.rare_sources)
@@ -594,6 +633,12 @@ class InfinitesimalREMLFitter:
                     self._partitioned_streamer.n_components,
                     list(self._partitioned_streamer._component_block_sizes),
                 )
+            if self._admix_sqrt_weights is not None:
+                logger.info(
+                    "admixed covariance mode enabled n_components=%d names=%s",
+                    int(self._admix_sqrt_weights.shape[1]),
+                    list(self._admix_component_names),
+                )
             if len(self.streamers) > 1 and not self._has_sparse:
                 logger.info(
                     "multi_grm call plan: total_calls=%d streamers=%d "
@@ -746,6 +791,63 @@ class InfinitesimalREMLFitter:
         return conf
 
     def _assemble_reml_operators(self) -> _OperatorBundle:
+        if self._admix_sqrt_weights is not None:
+            st = self.streamers[0]
+            sqrt_w = self._admix_sqrt_weights
+            G = int(sqrt_w.shape[1])
+
+            def _weighted_kv(V, component_idx, st=st, sqrt_w=sqrt_w):
+                V_dev = _ensure_on_device(V, st.dev)
+                squeeze = V_dev.ndim == 1
+                if squeeze:
+                    V_work = V_dev[:, None]
+                else:
+                    V_work = V_dev
+                w = sqrt_w[:, component_idx].astype(V_work.dtype)
+                out = w[:, None] * st.kv(w[:, None] * V_work, normalize=True)
+                return out[:, 0] if squeeze else out
+
+            K_mvs = tuple(
+                (lambda V, component_idx=component_idx: _weighted_kv(V, component_idx))
+                for component_idx in range(G)
+            )
+            diag_list = tuple(
+                sqrt_w[:, component_idx] * sqrt_w[:, component_idx]
+                for component_idx in range(G)
+            )
+
+            def weighted_hv(theta_g, theta_e, V, st=st, sqrt_w=sqrt_w):
+                theta_g_arr = jnp.asarray(theta_g)
+                if theta_g_arr.ndim != 1 or int(theta_g_arr.shape[0]) != G:
+                    raise ValueError(
+                        f"theta_g must have length {G} for admixed covariance mode."
+                    )
+                V_dev = _ensure_on_device(V, st.dev)
+                squeeze = V_dev.ndim == 1
+                V_work = V_dev[:, None] if squeeze else V_dev
+                acc = (
+                    jnp.asarray(theta_e, dtype=V_work.dtype) * V_work
+                    if theta_e is not None
+                    else jnp.zeros_like(V_work)
+                )
+                for component_idx in range(G):
+                    w = sqrt_w[:, component_idx].astype(V_work.dtype)
+                    acc = acc + theta_g_arr[component_idx].astype(V_work.dtype) * (
+                        w[:, None] * st.kv(w[:, None] * V_work, normalize=True)
+                    )
+                return acc[:, 0] if squeeze else acc
+
+            def stacked_kv(V):
+                return jnp.stack([_weighted_kv(V, component_idx) for component_idx in range(G)], axis=0)
+
+            return _OperatorBundle(
+                K_mvs=K_mvs,
+                diag_list=diag_list,
+                weighted_hv=weighted_hv,
+                stacked_kv=stacked_kv,
+                projected_core_atoms=None,
+            )
+
         if self._smile_operators:
             ops = tuple(self._smile_operators)
 
@@ -1145,6 +1247,11 @@ class InfinitesimalREMLFitter:
         alpha: jnp.ndarray,
         theta_g: jnp.ndarray,
     ) -> tuple[jnp.ndarray, ...]:
+        if self._admix_sqrt_weights is not None:
+            raise NotImplementedError(
+                "SNP-effect export is not implemented for admixed covariance mode because "
+                "the random effect is sample-weighted as D_a^{1/2} Z beta_a."
+            )
         if self._smile_operators:
             theta_g_arr = jnp.asarray(theta_g)
             if theta_g_arr.ndim != 1 or int(theta_g_arr.shape[0]) != len(self._smile_operators):

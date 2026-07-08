@@ -51,6 +51,8 @@ _EXPORTS: dict[str, str] = {
     "load_rds_matrix": ".smile_block_w",
     "load_weight_matrix": ".smile_block_w",
     "validate_weight_matrix": ".smile_block_w",
+    "AdmixtureQ": ".admixed_cov",
+    "load_admixture_q_aligned": ".admixed_cov",
 }
 
 __all__ = list(_EXPORTS)

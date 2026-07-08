@@ -36,6 +36,7 @@ _pred_io_mod = importlib.import_module(f"{pkg_name}.prediction_io")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _smile_mod = importlib.import_module(f"{pkg_name}.smile_block_w")
 _smile_planner_mod = importlib.import_module(f"{pkg_name}.smile_planner")
+_admix_mod = importlib.import_module(f"{pkg_name}.admixed_cov")
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
 load_component_specs = _component_spec_mod.load_component_specs
@@ -46,6 +47,7 @@ write_prediction_outputs = _pred_io_mod.write_prediction_outputs
 ensure_parent_dir = _io_utils_mod.ensure_parent_dir
 load_weight_matrix_shape = _smile_mod.load_weight_matrix_shape
 run_smile_planner = _smile_planner_mod.run_smile_planner
+load_admixture_q_aligned = _admix_mod.load_admixture_q_aligned
 _source_mod = importlib.import_module(f"{pkg_name}.geno_source")
 PgenGenoSource = _source_mod.PgenGenoSource
 env = _common_mod.env
@@ -108,6 +110,20 @@ def _matrix_size_from_shape(shape: tuple[int, ...]) -> int:
     if len(shape) != 2 or int(shape[0]) != int(shape[1]):
         raise SystemExit(f"SMILE W matrix must be square, got shape {shape}.")
     return int(shape[0])
+
+
+def _infer_admix_fam_path(q_path: str) -> str:
+    if q_path.endswith(".Q"):
+        prefix = q_path[:-2]
+        parts = prefix.rsplit(".", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return parts[0] + ".fam"
+    return os.path.splitext(q_path)[0] + ".fam"
+
+
+def _parse_component_names(raw: str) -> list[str] | None:
+    names = [part.strip() for part in raw.split(",") if part.strip()]
+    return names or None
 
 
 def parse_args():
@@ -236,6 +252,24 @@ def parse_args():
         default=float(env("SMILE_SCORING_STEP_TOL", "1e-4")),
         help="Relative parameter-change tolerance for --smile-optimizer smile_scoring.",
     )
+    p.add_argument(
+        "--admix-q",
+        default=env("ADMIX_Q", ""),
+        help=(
+            "ADMIXTURE .Q file for admixed covariance mode. This creates one "
+            "sample-weighted GRM per Q column: D_a^1/2 K D_a^1/2."
+        ),
+    )
+    p.add_argument(
+        "--admix-fam",
+        default=env("ADMIX_FAM", ""),
+        help="FAM file whose row order matches --admix-q. Defaults to the inferred ADMIXTURE input .fam.",
+    )
+    p.add_argument(
+        "--admix-component-names",
+        default=env("ADMIX_COMPONENT_NAMES", ""),
+        help="Optional comma-separated names for ADMIXTURE Q columns.",
+    )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
     p.add_argument("--prediction-bed-prefix", default=env("PREDICTION_BED_PREFIX", ""),
@@ -336,6 +370,7 @@ def main():
         ]
     smile_inputs_present = bool(args.identity_w or smile_w_files or smile_w_file_groups)
     use_smile = bool(args.smile or smile_inputs_present)
+    use_admixed = bool(args.admix_q.strip())
     smile_n_grm = (
         len(smile_w_file_groups)
         if smile_w_file_groups
@@ -386,6 +421,16 @@ def main():
         raise SystemExit("SMILE block-W mode requires exactly one dense genotype input.")
     if use_smile and len(bed_list) > 1:
         raise SystemExit("SMILE block-W mode cannot be combined with multiple BED prefixes.")
+    if use_admixed and use_smile:
+        raise SystemExit("Admixed covariance mode cannot be combined with SMILE mode.")
+    if use_admixed and (vc_block_sizes or component_variant_indices):
+        raise SystemExit("Admixed covariance mode cannot be combined with component partitioning.")
+    if use_admixed and (rare_bed_list or rare_pgen_prefix):
+        raise SystemExit("Admixed covariance mode is currently supported only for dense-only fits.")
+    if use_admixed and _n_dense != 1:
+        raise SystemExit("Admixed covariance mode requires exactly one dense genotype input.")
+    if use_admixed and (args.compute_effects or prediction_active):
+        raise SystemExit("Admixed covariance mode currently supports variance-component estimation only.")
     if vc_block_sizes or component_variant_indices:
         if _n_dense != 1:
             raise SystemExit("single-source component partitioning requires exactly one dense input.")
@@ -432,6 +477,26 @@ def main():
     if X_np is not None:
         X_np = X_np.astype(np.float32, copy=False)
     logger.info("Loaded %d samples; dropped %d", y_np.shape[0], len(dropped))
+
+    admix_weights = None
+    admix_component_names = None
+    if use_admixed:
+        admix_fam_path = args.admix_fam.strip() or _infer_admix_fam_path(args.admix_q.strip())
+        admix = load_admixture_q_aligned(
+            q_path=args.admix_q.strip(),
+            q_fam_path=admix_fam_path,
+            sample_ids=fam_keep,
+            component_names=_parse_component_names(args.admix_component_names),
+        )
+        admix_weights = admix.weights
+        admix_component_names = admix.component_names
+        logger.info(
+            "Loaded ADMIXTURE Q: path=%s fam=%s n=%d K=%d",
+            args.admix_q.strip(),
+            admix_fam_path,
+            int(admix_weights.shape[0]),
+            int(admix_weights.shape[1]),
+        )
 
     # ---- PGEN direct read or BED sample-mask ---------------------------------
     sources = None
@@ -491,6 +556,9 @@ def main():
     planner_kwargs = dict(
         n_samples=y_np.shape[0], p_list=p_list,
         n_grm=(
+            int(admix_weights.shape[1])
+            if admix_weights is not None
+            else
             smile_n_grm
             if use_smile
             else len(component_variant_indices)
@@ -577,6 +645,11 @@ def main():
             ),
             args.w_normalization,
         )
+    if admix_weights is not None:
+        logger.info(
+            "Admixed covariance mode enabled with %d ancestry components.",
+            int(admix_weights.shape[1]),
+        )
 
     if sources is not None:
         cfg = FitConfig(
@@ -593,6 +666,8 @@ def main():
             smile_w_device_cache_bytes=getattr(plan, "smile_w_device_cache_bytes", None),
             smile_optimizer=args.smile_optimizer,
             smile_scoring_step_tol=args.smile_scoring_step_tol,
+            admix_weights=admix_weights,
+            admix_component_names=admix_component_names,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
@@ -620,6 +695,8 @@ def main():
             smile_w_device_cache_bytes=getattr(plan, "smile_w_device_cache_bytes", None),
             smile_optimizer=args.smile_optimizer,
             smile_scoring_step_tol=args.smile_scoring_step_tol,
+            admix_weights=admix_weights,
+            admix_component_names=admix_component_names,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
@@ -649,6 +726,13 @@ def main():
         total = float(np.sum(vc))
         if total > 0:
             print(f"h2: {float(np.sum(vc[:-1]) / total):.6f}")
+        if admix_weights is not None:
+            sigma2 = float(vc[-1])
+            names = tuple(admix_component_names or [f"admix_{idx:03d}" for idx in range(vc.size - 1)])
+            print("admixed_h2_by_component:")
+            for name, tau2 in zip(names, vc[:-1]):
+                h2_a = float(tau2 / sigma2) if sigma2 > 0 else float("nan")
+                print(f"  {name}: tau2={float(tau2):.6g} sigma2={sigma2:.6g} h2_a={h2_a:.6g}")
     if res.history:
         for it in res.history:
             pcg = it.get("pcg_iters", 0)

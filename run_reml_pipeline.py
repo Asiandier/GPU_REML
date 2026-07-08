@@ -126,6 +126,11 @@ def _parse_component_names(raw: str) -> list[str] | None:
     return names or None
 
 
+def _admixed_component_h2(tau2: float, sigma2: float) -> float:
+    denom = float(tau2) + float(sigma2)
+    return float(tau2) / denom if denom > 0 else float("nan")
+
+
 def _parse_bool_env_default_true(name: str) -> bool:
     raw = env(name, "true").strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -738,7 +743,7 @@ def main():
             names = tuple(admix_component_names or [f"admix_{idx:03d}" for idx in range(vc.size - 1)])
             print("admixed_h2_by_component:")
             for name, tau2 in zip(names, vc[:-1]):
-                h2_a = float(tau2 / sigma2) if sigma2 > 0 else float("nan")
+                h2_a = _admixed_component_h2(float(tau2), sigma2)
                 print(f"  {name}: tau2={float(tau2):.6g} sigma2={sigma2:.6g} h2_a={h2_a:.6g}")
     if res.history:
         for it in res.history:

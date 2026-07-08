@@ -126,6 +126,11 @@ def _parse_component_names(raw: str) -> list[str] | None:
     return names or None
 
 
+def _parse_bool_env_default_true(name: str) -> bool:
+    raw = env(name, "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Run GPU-accelerated REML pipeline.")
     # Genotype input — exactly one of the two groups must be supplied
@@ -325,9 +330,11 @@ def parse_args():
         help="Write final variance components, Average Information matrix, gradient and fit metadata to <out-prefix>.*.",
     )
     p.add_argument(
-        "--verbose",
-        action="store_true",
-        default=env("VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"},
+        "--non-verbose",
+        action="store_false",
+        dest="verbose",
+        default=_parse_bool_env_default_true("VERBOSE"),
+        help="Disable detailed REML logging.",
     )
     return p.parse_args()
 

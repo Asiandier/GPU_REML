@@ -55,10 +55,12 @@ from dataclasses import dataclass
 class REMLContext:
     n: int
     G: int
+    E: int
     K_mvs: tuple
     weighted_hv: Optional[Callable[[Array, Array, Array], Array]]
     stacked_kv: Optional[Callable[[Array], Array]]
     diag_stack: Optional[Array]
+    residual_diag_stack: Optional[Array]
     xmat: Optional[Array]
     y: Array
     rhs_const: Array
@@ -70,6 +72,7 @@ class REMLContext:
     precond_conf: Optional[ProjectedCorePrecondConf]
     kvrand_stack: Optional[Array] = None
     diag_atoms: Optional[Array] = None
+    residual_diag_atoms: Optional[Array] = None
 
 
 @dataclass
@@ -323,9 +326,17 @@ def _hv_apply(
     theta_g: Array,
     theta_e: Array,
     V: Array,
+    residual_diag_stack: Optional[Array] = None,
 ) -> Array:
-    """H·V = Σ_i theta_g[i] K_i(V) + theta_e * V."""
-    acc = theta_e * V
+    """H·V = Σ_i theta_g[i] K_i(V) + Σ_j theta_e[j] R_j(V)."""
+    if residual_diag_stack is None:
+        acc = theta_e.reshape(-1)[0] * V
+    else:
+        V_mat = V[:, None] if V.ndim == 1 else V
+        resid_diag = jnp.tensordot(theta_e, residual_diag_stack, axes=1)
+        acc = resid_diag[:, None] * V_mat
+        if V.ndim == 1:
+            acc = acc[:, 0]
     for i, mv in enumerate(K_mvs):
         acc = acc + theta_g[i] * mv(V)
     return acc
@@ -349,6 +360,24 @@ def _apply_genetic_stack(
     return jnp.stack([ctx.K_mvs[int(i)](V) for i in component_idx_np], axis=0)
 
 
+def _apply_residual_stack(ctx: REMLContext, V: Array) -> Array:
+    """Return residual-component matvecs with shape (E, n, rhs)."""
+    V_mat = V[:, None] if V.ndim == 1 else V
+    if ctx.residual_diag_stack is None:
+        out = V_mat[None, :, :]
+    else:
+        out = ctx.residual_diag_stack[:, :, None] * V_mat[None, :, :]
+    return out[:, :, 0] if V.ndim == 1 else out
+
+
+def _residual_diag_from_components(ctx: REMLContext, theta_e: Array) -> Array:
+    """Return the exact diagonal contribution of residual components."""
+    theta_e_arr = jnp.asarray(theta_e).reshape(-1)
+    if ctx.residual_diag_stack is None:
+        return theta_e_arr[0]
+    return jnp.tensordot(theta_e_arr, ctx.residual_diag_stack, axes=1)
+
+
 # ---------------------------------------------------------------------------
 # eval_once: Python-level orchestration (NOT jax.jit wrapped as a whole)
 # ---------------------------------------------------------------------------
@@ -356,15 +385,15 @@ def _apply_genetic_stack(
 def _compute_traces_from_pcg(
     sol_all: Array,
     ctx: REMLContext,
-) -> tuple[Array, Array]:
-    """Estimate tr(H⁻¹) and tr(H⁻¹ K_i) from the PCG solution.
+) -> tuple[Array, Array, Array]:
+    """Estimate tr(H⁻¹ R_j) and tr(H⁻¹ K_i) from the PCG solution.
 
     Uses the random vectors already embedded in rhs_const and their
     PCG solutions. When cached K_i @ Vrand blocks are available, the
     component traces need no extra PCG columns.
 
     Returns:
-        tr_Hinv:     () scalar  ≈ tr(H⁻¹)
+        tr_Hinv_R:   (E,) array ≈ [tr(H⁻¹ R_0), ..., tr(H⁻¹ R_{E-1})]
         tr_Hinv_K:   (G,) array ≈ [tr(H⁻¹ K_0), ..., tr(H⁻¹ K_{G-1})]
     """
     vrand_start = ctx.y_col + 1          # column right after y in RHS
@@ -376,8 +405,16 @@ def _compute_traces_from_pcg(
     # Vrand is stored in rhs_const at the same column range
     Vrand_cols = ctx.rhs_const[:, vrand_start:vrand_stop]
 
-    # tr(H⁻¹) ≈ (1/R) Σ_r v_r^T (H⁻¹ v_r)
-    tr_Hinv = jnp.sum(Vrand_cols * HinvVrand) / float(R)
+    if ctx.residual_diag_stack is None:
+        tr_Hinv_R = (jnp.sum(Vrand_cols * HinvVrand) / float(R))[None]
+    else:
+        tr_Hinv_R = jnp.einsum(
+            "nr,en,nr->e",
+            Vrand_cols,
+            ctx.residual_diag_stack,
+            HinvVrand,
+            precision=jax.lax.Precision.HIGH,
+        ) / float(R)
 
     if ctx.kvrand_stack is not None:
         tr_Hinv_K = jnp.einsum(
@@ -396,7 +433,7 @@ def _compute_traces_from_pcg(
             Vrand_cols[:, None, :] * HinvGZrand, axis=(0, 2)
         ) / float(R)
 
-    return tr_Hinv, tr_Hinv_K
+    return tr_Hinv_R, tr_Hinv_K
 
 
 def _eval_once(
@@ -422,26 +459,27 @@ def _eval_once(
     If *taylor_logdet* is provided (not None), the SLQ logdet computation
     is skipped and this pre-computed value is used instead.
     """
-    theta_g = pvec[:-1]
-    theta_e = pvec[-1]
+    theta_g = pvec[:ctx.G]
+    theta_e = pvec[ctx.G:]
 
     def Hv(V: Array) -> Array:
         if ctx.weighted_hv is not None:
-            return ctx.weighted_hv(theta_g, theta_e, V)
-        return _hv_apply(ctx.K_mvs, theta_g, theta_e, V)
+            theta_e_arg = theta_e[0] if ctx.E == 1 else theta_e
+            return ctx.weighted_hv(theta_g, theta_e_arg, V)
+        return _hv_apply(ctx.K_mvs, theta_g, theta_e, V, ctx.residual_diag_stack)
 
     diag_H_scalar = scalar_diag_from_precond_conf(ctx.precond_conf, theta_g, theta_e)
     if diag_H_scalar is not None:
         diag_H = diag_H_scalar
     else:
         if ctx.diag_atoms is not None:
-            diag_H = theta_e + jnp.dot(theta_g, ctx.diag_atoms)
+            diag_H = _residual_diag_from_components(ctx, theta_e) + jnp.dot(theta_g, ctx.diag_atoms)
         else:
             if ctx.diag_stack is None:
                 raise ValueError(
                     "diag_stack is required when the preconditioner does not provide a scalar diagonal."
                 )
-            diag_H = theta_e + jnp.tensordot(theta_g, ctx.diag_stack, axes=1)
+            diag_H = _residual_diag_from_components(ctx, theta_e) + jnp.tensordot(theta_g, ctx.diag_stack, axes=1)
     use_residual_slq = (
         slq_mode == "projected_core_residual"
         and taylor_logdet is None
@@ -497,11 +535,11 @@ def _eval_once(
 
     PYstar = proj(HinvXyZ[:, ctx.y_col : ctx.rand_stop])
 
-    # K_i(P[y | Z]) — kv in Python scope. The final stacked row is the
-    # residual component I(P[y | Z]) = P[y | Z].
+    # K_i(P[y | Z]) and R_j(P[y | Z]) — kv in Python scope for genetic terms.
     GPYstar_genetic = _apply_genetic_stack(ctx, PYstar)
-    GPYstar_stack = jnp.concatenate([GPYstar_genetic, PYstar[None, :, :]], axis=0)
-    GPZrand_stack = GPYstar_stack[:, :, 1:]  # (G+1, n, R)
+    GPYstar_residual = _apply_residual_stack(ctx, PYstar)
+    GPYstar_stack = jnp.concatenate([GPYstar_genetic, GPYstar_residual], axis=0)
+    GPZrand_stack = GPYstar_stack[:, :, 1:]  # (G+E, n, R)
     Vrand_cols = ctx.rhs_const[:, ctx.y_col + 1 : ctx.rand_stop]
 
     # ---- REML statistics (pure XLA) ----------------------------------------
@@ -541,10 +579,10 @@ def _eval_once(
         logdet = _slq_logdet(Hv, ctx.n, key_slq, nsamples=slq_samples, m=slq_m)
 
     fisher_stats = FisherSolveStats()
-    fisher_stats.free_dim = int(ctx.G + 1)
+    fisher_stats.free_dim = int(ctx.G + ctx.E)
     fisher_stats.frozen_genetic = 0
-    GPy_cols = jnp.swapaxes(GPYstar_stack[:, :, 0], 0, 1)  # (n, G+1)
-    if warm_ai_ready and warm_ai is not None and warm_ai.shape[1] == ctx.G + 1:
+    GPy_cols = jnp.swapaxes(GPYstar_stack[:, :, 0], 0, 1)  # (n, G+E)
+    if warm_ai_ready and warm_ai is not None and warm_ai.shape[1] == ctx.G + ctx.E:
         if M_cur is not None:
             ai_resid = GPy_cols - Hv(warm_ai)
             X0_ai = warm_ai + M_cur(ai_resid)
@@ -565,9 +603,9 @@ def _eval_once(
 
     # ---- Trace estimates for Taylor warm-start ------------------------------
     if compute_traces:
-        tr_Hinv, tr_Hinv_K = _compute_traces_from_pcg(sol_all, ctx)
+        tr_Hinv_R, tr_Hinv_K = _compute_traces_from_pcg(sol_all, ctx)
     else:
-        tr_Hinv = jnp.asarray(jnp.nan, dtype=sol_all.dtype)
+        tr_Hinv_R = jnp.full((ctx.E,), jnp.nan, dtype=sol_all.dtype)
         tr_Hinv_K = jnp.full((ctx.G,), jnp.nan, dtype=sol_all.dtype)
 
     # ---- Assemble ll, grad, FI ----------------------------------------------
@@ -597,7 +635,7 @@ def _eval_once(
         jnp.asarray(k_pcg, dtype=jnp.int32),
         warm_all_next,
         warm_ai_next,
-        tr_Hinv,
+        tr_Hinv_R,
         tr_Hinv_K,
         logdet,
     )
@@ -644,12 +682,13 @@ def _solve_reduced_fisher_step(
     grad: Array,
     FI,
     *,
+    n_genetic: int,
     freeze_mask_np: np.ndarray,
     fixed_step: Array,
 ) -> tuple[Array, np.ndarray]:
-    G = param.shape[0] - 1
     free_g_idx_np = np.flatnonzero(~freeze_mask_np)
-    free_idx_np = np.concatenate([free_g_idx_np, np.array([G], dtype=np.int64)])
+    residual_idx_np = np.arange(n_genetic, int(param.shape[0]), dtype=np.int64)
+    free_idx_np = np.concatenate([free_g_idx_np, residual_idx_np])
     free_idx = jnp.asarray(free_idx_np, dtype=jnp.int32)
 
     rhs_f = grad[free_idx] - _apply_fisher_system(FI, fixed_step)[free_idx]
@@ -675,6 +714,7 @@ def _solve_reduced_fisher_step(
 
 
 def _projected_gradient_inf_norm(param: Array, grad: Array, zero_tol: float) -> Array:
+    # Backward-compatible helper for the standard G genetic + 1 residual case.
     theta_g = param[:-1]
     grad_g = grad[:-1]
     zero_tol_arr = jnp.asarray(zero_tol, dtype=param.dtype)
@@ -683,11 +723,27 @@ def _projected_gradient_inf_norm(param: Array, grad: Array, zero_tol: float) -> 
     return jnp.max(jnp.abs(proj_all))
 
 
+def _projected_gradient_inf_norm_split(
+    param: Array,
+    grad: Array,
+    *,
+    n_genetic: int,
+    zero_tol: float,
+) -> Array:
+    theta_g = param[:n_genetic]
+    grad_g = grad[:n_genetic]
+    zero_tol_arr = jnp.asarray(zero_tol, dtype=param.dtype)
+    proj_g = jnp.where(theta_g > zero_tol_arr, grad_g, jnp.maximum(grad_g, 0.0))
+    proj_all = jnp.concatenate([proj_g, grad[n_genetic:]])
+    return jnp.max(jnp.abs(proj_all))
+
+
 def _projected_fisher_direction(
     param: Array,
     grad: Array,
     FI,
     *,
+    n_genetic: Optional[int] = None,
     genetic_zero_tol: float,
     trial_alpha: float = 1.0,
     workset_log_fn: Optional[Callable[[dict[str, object]], None]] = None,
@@ -700,10 +756,12 @@ def _projected_fisher_direction(
     added to the freeze set, fixed to hit the boundary exactly at that trial
     step, and the reduced Newton system is resolved on the remaining free set.
     """
-    G = param.shape[0] - 1
+    G = int(param.shape[0] - 1) if n_genetic is None else int(n_genetic)
+    if G < 0 or G > int(param.shape[0]):
+        raise ValueError("n_genetic must be between 0 and len(param).")
     if isinstance(FI, AverageInfoMatrix) and FI.stats is not None:
         initial_freeze = np.asarray(
-            _freeze_mask(param[:-1], grad[:-1], genetic_zero_tol),
+            _freeze_mask(param[:G], grad[:G], genetic_zero_tol),
             dtype=bool,
         )
         _reset_fisher_solve_stats(
@@ -713,7 +771,7 @@ def _projected_fisher_direction(
         )
         _reset_fisher_workingset_stats(FI.stats)
     freeze_mask_np = np.asarray(
-        _freeze_mask(param[:-1], grad[:-1], genetic_zero_tol),
+        _freeze_mask(param[:G], grad[:G], genetic_zero_tol),
         dtype=bool,
     )
     if trial_alpha <= 0.0:
@@ -728,10 +786,11 @@ def _projected_fisher_direction(
             param,
             grad,
             FI,
+            n_genetic=G,
             freeze_mask_np=freeze_mask_np,
             fixed_step=fixed_step,
         )
-        theta_trial_g = param[:-1] + jnp.asarray(trial_alpha, dtype=param.dtype) * step_dir[:-1]
+        theta_trial_g = param[:G] + jnp.asarray(trial_alpha, dtype=param.dtype) * step_dir[:G]
         violating_np = np.asarray(theta_trial_g < -genetic_zero_tol, dtype=bool) & (~freeze_mask_np)
         fixed_this_resolve = int(np.sum(violating_np))
 
@@ -774,21 +833,23 @@ def _apply_projected_step(
     step_dir: Array,
     alpha: float,
     *,
+    n_genetic: Optional[int] = None,
     genetic_zero_tol: float,
     residual_floor: float,
 ) -> tuple[Array, Array]:
     alpha_arr = jnp.asarray(alpha, dtype=param.dtype)
-    theta_g = param[:-1]
-    step_g = step_dir[:-1]
+    G = int(param.shape[0] - 1) if n_genetic is None else int(n_genetic)
+    theta_g = param[:G]
+    step_g = step_dir[:G]
 
     theta_g_updated = theta_g + alpha_arr * step_g
     theta_g_updated = jnp.maximum(theta_g_updated, 0.0)
     theta_g_updated = jnp.where(theta_g_updated <= genetic_zero_tol, 0.0, theta_g_updated)
     theta_e_updated = jnp.maximum(
-        param[-1] + alpha_arr * step_dir[-1],
+        param[G:] + alpha_arr * step_dir[G:],
         jnp.asarray(residual_floor, dtype=param.dtype),
     )
-    param_updated = jnp.concatenate([theta_g_updated, theta_e_updated[None]], axis=0)
+    param_updated = jnp.concatenate([theta_g_updated, theta_e_updated], axis=0)
     delta_param = param_updated - param
     return param_updated, delta_param
 
@@ -817,6 +878,7 @@ def fit_reml(
     precond_eps: float = 1e-6,
     weighted_hv: Optional[Callable[[Array, Array, Array], Array]] = None,
     stacked_kv: Optional[Callable[[Array], Array]] = None,
+    residual_diag_list: Optional[Sequence[Array]] = None,
     residual_floor: float = 1e-2,
     genetic_zero_tol: float = 1e-8,
     max_linesearch_trials: int = 3,
@@ -846,6 +908,28 @@ def fit_reml(
     G = len(K_mvs)
     if G != len(diag_list):
         raise ValueError("Length of K_mvs and diag_list must match.")
+    if residual_diag_list is None:
+        residual_diag_stack = None
+        residual_diag_atoms = jnp.ones((1,), dtype=jnp.float32)
+        E = 1
+    else:
+        residual_diag_list = tuple(residual_diag_list)
+        if not residual_diag_list:
+            raise ValueError("residual_diag_list must be non-empty when provided.")
+        residual_diag_stack = jnp.stack(
+            [jnp.asarray(d, dtype=jnp.float32).reshape(-1) for d in residual_diag_list],
+            axis=0,
+        )
+        if int(residual_diag_stack.shape[1]) != int(n):
+            raise ValueError(
+                "residual_diag_list entries must have length matching the number of samples."
+            )
+        if not bool(jnp.all(jnp.isfinite(residual_diag_stack))):
+            raise ValueError("residual_diag_list contains non-finite values.")
+        if bool(jnp.any(residual_diag_stack < 0.0)):
+            raise ValueError("residual_diag_list entries must be nonnegative.")
+        residual_diag_atoms = jnp.mean(residual_diag_stack, axis=1)
+        E = int(residual_diag_stack.shape[0])
     if slq_samples <= 0:
         raise ValueError("fit_reml requires slq_samples > 0.")
     if slq_mode not in {"raw", "projected_core_residual"}:
@@ -877,8 +961,8 @@ def fit_reml(
     compact_log = bool(verbose) and log_detail == "compact"
     if verbose:
         logger.info(
-            "[REML] start @ %s n=%d G=%d n_rand_vec=%d slq_samples=%d slq_mode=%s",
-            datetime.now().isoformat(timespec='seconds'), n, G, n_rand_vec, slq_samples, slq_mode,
+            "[REML] start @ %s n=%d G=%d E=%d n_rand_vec=%d slq_samples=%d slq_mode=%s",
+            datetime.now().isoformat(timespec='seconds'), n, G, E, n_rand_vec, slq_samples, slq_mode,
         )
 
     key_master = jax.random.PRNGKey(seed + 2026)
@@ -899,21 +983,21 @@ def fit_reml(
 
     if param_init is not None:
         p0 = jnp.asarray(param_init, dtype=jnp.float32).reshape(-1)
-        if p0.shape[0] != G + 1:
+        if p0.shape[0] != G + E:
             raise ValueError(
-                f"param_init length mismatch: expected {G + 1}, got {p0.shape[0]}"
+                f"param_init length mismatch: expected {G + E}, got {p0.shape[0]}"
             )
         if not bool(jnp.all(jnp.isfinite(p0))):
             raise ValueError("param_init contains non-finite values.")
-        theta_g0 = jnp.maximum(p0[:-1], 0.0)
+        theta_g0 = jnp.maximum(p0[:G], 0.0)
         theta_g0 = jnp.where(theta_g0 <= genetic_zero_tol, 0.0, theta_g0)
-        theta_e0 = jnp.maximum(p0[-1], jnp.asarray(residual_floor, dtype=p0.dtype))
-        param = jnp.concatenate([theta_g0, theta_e0[None]], axis=0)
+        theta_e0 = jnp.maximum(p0[G:], jnp.asarray(residual_floor, dtype=p0.dtype))
+        param = jnp.concatenate([theta_g0, theta_e0], axis=0)
     else:
         theta_g = jnp.full((G,), h2_init / max(G, 1), dtype=jnp.float32)
-        theta_e = jnp.array(1.0 - h2_init, dtype=jnp.float32)
+        theta_e = jnp.full((E,), 1.0 - h2_init, dtype=jnp.float32)
         param = jnp.concatenate(
-            [jnp.maximum(theta_g, 0.0), jnp.maximum(theta_e, jnp.asarray(residual_floor, dtype=theta_e.dtype))[None]],
+            [jnp.maximum(theta_g, 0.0), jnp.maximum(theta_e, jnp.asarray(residual_floor, dtype=theta_e.dtype))],
             axis=0,
         )
 
@@ -953,11 +1037,12 @@ def fit_reml(
     rhs_const = jnp.concatenate(rhs_parts, axis=1)
 
     ctx = REMLContext(
-        n=n, G=G,
+        n=n, G=G, E=E,
         K_mvs=tuple(K_mvs),
         weighted_hv=weighted_hv,
         stacked_kv=stacked_kv,
         diag_stack=diag_stack,
+        residual_diag_stack=residual_diag_stack,
         xmat=xmat,
         y=y,
         rhs_const=rhs_const,
@@ -969,6 +1054,7 @@ def fit_reml(
         precond_conf=precond_conf,
         kvrand_stack=KVrand_stack,
         diag_atoms=diag_atoms,
+        residual_diag_atoms=residual_diag_atoms,
     )
     del rhs_parts
     del KVrand_stack
@@ -983,7 +1069,7 @@ def fit_reml(
 
     n_warm_cols   = rhs_const.shape[1]
     warm_all      = jnp.full((n, n_warm_cols), jnp.nan, dtype=jnp.float32)
-    warm_ai       = jnp.full((n, G + 1), jnp.nan, dtype=jnp.float32)
+    warm_ai       = jnp.full((n, G + E), jnp.nan, dtype=jnp.float32)
     warm_ready    = False       # Python flag — avoids GPU→CPU sync on NaN check
     warm_ai_ready = False
 
@@ -1022,14 +1108,19 @@ def fit_reml(
         )
         if len(result) == 8:
             ll, grad, FI, k_pcg, warm_next, tr_Hinv, tr_Hinv_K, logdet = result
-            return ll, grad, FI, k_pcg, warm_next, warm_ai_cur, tr_Hinv, tr_Hinv_K, logdet
+            tr_Hinv_R = jnp.asarray(tr_Hinv, dtype=jnp.asarray(pvec).dtype).reshape(-1)
+            return ll, grad, FI, k_pcg, warm_next, warm_ai_cur, tr_Hinv_R, tr_Hinv_K, logdet
+        if len(result) == 9:
+            ll, grad, FI, k_pcg, warm_next, warm_ai_next, tr_Hinv, tr_Hinv_K, logdet = result
+            tr_Hinv_R = jnp.asarray(tr_Hinv, dtype=jnp.asarray(pvec).dtype).reshape(-1)
+            return ll, grad, FI, k_pcg, warm_next, warm_ai_next, tr_Hinv_R, tr_Hinv_K, logdet
         return result
 
     # Warmup
     if full_log:
         _t_eval = time.time()
         logger.info("[REML] warmup eval @ %s", datetime.now().isoformat(timespec='seconds'))
-    ll, grad, FI, k_pcg0, warm_all, warm_ai, tr_Hinv_cached, tr_Hinv_K_cached, logdet_cached = _run_eval(
+    ll, grad, FI, k_pcg0, warm_all, warm_ai, tr_Hinv_R_cached, tr_Hinv_K_cached, logdet_cached = _run_eval(
         param, warm_all, warm_ai, warmup_pcg_tol, warm_ready, warm_ai_ready, compute_traces=True
     )
     warm_ready = True
@@ -1090,7 +1181,7 @@ def fit_reml(
         FI_new = FI
         warm_next = warm_all
         warm_ai_next = warm_ai
-        tr_Hinv_new = tr_Hinv_cached
+        tr_Hinv_R_new = tr_Hinv_R_cached
         tr_Hinv_K_new = tr_Hinv_K_cached
         logdet_new = logdet_cached
         eval_elapsed = 0.0
@@ -1121,6 +1212,7 @@ def fit_reml(
                 param,
                 grad,
                 FI,
+                n_genetic=G,
                 genetic_zero_tol=genetic_zero_tol,
                 trial_alpha=alpha_used,
                 workset_log_fn=_log_workset_resolve,
@@ -1138,6 +1230,7 @@ def fit_reml(
                 param,
                 step_dir,
                 alpha_used,
+                n_genetic=G,
                 genetic_zero_tol=genetic_zero_tol,
                 residual_floor=residual_floor,
             )
@@ -1150,12 +1243,12 @@ def fit_reml(
                 float(v) for v in jax.device_get((step_norm_arr, max_rel_dp_arr))
             )
             if max_rel_dp < taylor_threshold and logdet_cached is not None:
-                d_theta_g = delta_param[:-1]
-                d_theta_e = delta_param[-1]
+                d_theta_g = delta_param[:G]
+                d_theta_e = delta_param[G:]
                 # This is the cheap first-order update for log|H| only.
                 # The restricted term log|X^T H^{-1} X| is intentionally not
                 # expanded here; for n >> p this is a small approximation.
-                taylor_ld = logdet_cached + jnp.dot(d_theta_g, tr_Hinv_K_cached) + d_theta_e * tr_Hinv_cached
+                taylor_ld = logdet_cached + jnp.dot(d_theta_g, tr_Hinv_K_cached) + jnp.dot(d_theta_e, tr_Hinv_R_cached)
                 trial_use_taylor = True
 
             if precond_refresh_fn is not None and precond_refresh_reldp > 0.0:
@@ -1173,7 +1266,7 @@ def fit_reml(
                 iter_precond_refreshed = True
 
             eval_t0 = time.time()
-            ll_try, grad_try, FI_try, k_pcg_try, warm_try, warm_ai_try, _tr_Hinv_try, _tr_Hinv_K_try, logdet_try = _run_eval(
+            ll_try, grad_try, FI_try, k_pcg_try, warm_try, warm_ai_try, _tr_Hinv_R_try, _tr_Hinv_K_try, logdet_try = _run_eval(
                 param_updated,
                 trial_warm,
                 trial_warm_ai,
@@ -1202,7 +1295,7 @@ def fit_reml(
                 FI_new = FI_try
                 warm_next = warm_try
                 warm_ai_next = warm_ai_try
-                tr_Hinv_new, tr_Hinv_K_new = _compute_traces_from_pcg(warm_try, ctx)
+                tr_Hinv_R_new, tr_Hinv_K_new = _compute_traces_from_pcg(warm_try, ctx)
                 logdet_new = logdet_try
                 k_pcg = k_pcg_trial
                 eval_ai_pcg = ai_pcg_trial
@@ -1227,7 +1320,12 @@ def fit_reml(
                 ll_new,
                 ll,
                 jnp.linalg.norm(grad_new),
-                _projected_gradient_inf_norm(param_updated, grad_new, genetic_zero_tol),
+                _projected_gradient_inf_norm_split(
+                    param_updated,
+                    grad_new,
+                    n_genetic=G,
+                    zero_tol=genetic_zero_tol,
+                ),
                 delta_param,
                 param_updated,
                 jnp.sum(freeze_mask),
@@ -1331,7 +1429,7 @@ def fit_reml(
             warm_all = warm_next
             warm_ai  = warm_ai_next
             # Update cached traces for next Taylor warm-start.
-            tr_Hinv_cached   = tr_Hinv_new
+            tr_Hinv_R_cached = tr_Hinv_R_new
             tr_Hinv_K_cached = tr_Hinv_K_new
             # Update logdet anchor: on full SLQ iterations, replace with the
             # freshly computed value; on Taylor iterations, the Taylor estimate

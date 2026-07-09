@@ -280,6 +280,15 @@ def parse_args():
         default=env("ADMIX_COMPONENT_NAMES", ""),
         help="Optional comma-separated names for ADMIXTURE Q columns.",
     )
+    p.add_argument(
+        "--admix-residual-mode",
+        choices=["shared", "per-ancestry"],
+        default=env("ADMIX_RESIDUAL_MODE", "shared"),
+        help=(
+            "Residual variance model for --admix-q. 'shared' uses one sigma^2 I "
+            "(current default); 'per-ancestry' uses sum_a sigma_a^2 diag(theta_a)."
+        ),
+    )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
     p.add_argument("--prediction-bed-prefix", default=env("PREDICTION_BED_PREFIX", ""),
@@ -659,8 +668,9 @@ def main():
         )
     if admix_weights is not None:
         logger.info(
-            "Admixed covariance mode enabled with %d ancestry components.",
+            "Admixed covariance mode enabled with %d ancestry components; residual_mode=%s.",
             int(admix_weights.shape[1]),
+            args.admix_residual_mode,
         )
 
     if sources is not None:
@@ -680,6 +690,7 @@ def main():
             smile_scoring_step_tol=args.smile_scoring_step_tol,
             admix_weights=admix_weights,
             admix_component_names=admix_component_names,
+            admix_residual_mode=args.admix_residual_mode,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
@@ -709,6 +720,7 @@ def main():
             smile_scoring_step_tol=args.smile_scoring_step_tol,
             admix_weights=admix_weights,
             admix_component_names=admix_component_names,
+            admix_residual_mode=args.admix_residual_mode,
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
@@ -735,16 +747,52 @@ def main():
     print("var_components:", res.var_components)
     vc = np.asarray(res.var_components, dtype=float).reshape(-1)
     if vc.size >= 2:
-        total = float(np.sum(vc))
-        if total > 0:
-            print(f"h2: {float(np.sum(vc[:-1]) / total):.6f}")
         if admix_weights is not None:
-            sigma2 = float(vc[-1])
-            names = tuple(admix_component_names or [f"admix_{idx:03d}" for idx in range(vc.size - 1)])
+            n_admix = int(admix_weights.shape[1])
+            names = tuple(admix_component_names or [f"admix_{idx:03d}" for idx in range(n_admix)])
+            tau2 = vc[:n_admix]
             print("admixed_h2_by_component:")
-            for name, tau2 in zip(names, vc[:-1]):
-                h2_a = _admixed_component_h2(float(tau2), sigma2)
-                print(f"  {name}: tau2={float(tau2):.6g} sigma2={sigma2:.6g} h2_a={h2_a:.6g}")
+            if args.admix_residual_mode == "per-ancestry":
+                sigma2 = vc[n_admix : 2 * n_admix]
+                if sigma2.size != n_admix:
+                    raise ValueError(
+                        f"per-ancestry admix result expected {2 * n_admix} variance components, got {vc.size}."
+                    )
+                weighted_tau = admix_weights.astype(np.float64, copy=False) @ tau2
+                weighted_sigma = admix_weights.astype(np.float64, copy=False) @ sigma2
+                denom = weighted_tau + weighted_sigma
+                weighted_h2 = np.divide(
+                    weighted_tau,
+                    denom,
+                    out=np.full_like(weighted_tau, np.nan, dtype=np.float64),
+                    where=denom > 0,
+                )
+                avg_tau = float(np.mean(weighted_tau))
+                avg_sigma = float(np.mean(weighted_sigma))
+                avg_denom = avg_tau + avg_sigma
+                if avg_denom > 0:
+                    print(f"h2_weighted_mean: {avg_tau / avg_denom:.6f}")
+                print(f"weighted_tau_mean: {avg_tau:.6g}")
+                print(f"weighted_sigma_mean: {avg_sigma:.6g}")
+                print(f"weighted_h2_mean: {float(np.nanmean(weighted_h2)):.6f}")
+                for name, tau_val, sigma_val in zip(names, tau2, sigma2):
+                    h2_a = _admixed_component_h2(float(tau_val), float(sigma_val))
+                    print(
+                        f"  {name}: tau2={float(tau_val):.6g} "
+                        f"sigma2={float(sigma_val):.6g} h2_a={h2_a:.6g}"
+                    )
+            else:
+                total = float(np.sum(vc))
+                if total > 0:
+                    print(f"h2: {float(np.sum(vc[:-1]) / total):.6f}")
+                sigma2 = float(vc[-1])
+                for name, tau_val in zip(names, tau2):
+                    h2_a = _admixed_component_h2(float(tau_val), sigma2)
+                    print(f"  {name}: tau2={float(tau_val):.6g} sigma2={sigma2:.6g} h2_a={h2_a:.6g}")
+        else:
+            total = float(np.sum(vc))
+            if total > 0:
+                print(f"h2: {float(np.sum(vc[:-1]) / total):.6f}")
     if res.history:
         for it in res.history:
             pcg = it.get("pcg_iters", 0)
@@ -763,11 +811,22 @@ def main():
         np.save(grad_path, np.asarray(jax.device_get(res.final_grad), dtype=np.float64))
         import json
         with open(meta_path, "w") as f:
+            n_components_meta = (
+                int(admix_weights.shape[1])
+                if admix_weights is not None
+                else int(vc.size - 1)
+            )
             json.dump(
                 {
                     "n_samples": int(y_np.shape[0]),
                     "n_covar": int(X_np.shape[1]) if X_np is not None else 0,
-                    "n_components": int(vc.size - 1),
+                    "n_components": n_components_meta,
+                    "n_residual_components": (
+                        int(admix_weights.shape[1])
+                        if admix_weights is not None and args.admix_residual_mode == "per-ancestry"
+                        else 1
+                    ),
+                    "admix_residual_mode": args.admix_residual_mode if admix_weights is not None else None,
                     "loglik": None if res.final_loglik is None else float(res.final_loglik),
                     "theta_npy": theta_path,
                     "ai_npy": ai_path,

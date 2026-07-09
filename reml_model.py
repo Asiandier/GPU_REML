@@ -48,6 +48,7 @@ class FitConfig:
     smile_scoring_step_tol: float = 1e-4
     admix_weights: np.ndarray | None = None
     admix_component_names: Sequence[str] | None = None
+    admix_residual_mode: str = "shared"
     standardization_overrides: Sequence[tuple[np.ndarray, np.ndarray]] | None = None
     sample_mask: np.ndarray | None = None  # bool mask for sample subsetting
     call_width: int = 131072
@@ -119,6 +120,7 @@ class _OperatorBundle:
     diag_list: tuple[jnp.ndarray, ...]
     weighted_hv: object
     stacked_kv: object
+    residual_diag_list: tuple[jnp.ndarray, ...] | None = None
     projected_core_atoms: object | None = None
 
 
@@ -284,7 +286,11 @@ class InfinitesimalREMLFitter:
         self._smile_operator = None
         self._smile_operators = ()
         self._admix_sqrt_weights = None
+        self._admix_weights = None
         self._admix_component_names: tuple[str, ...] = ()
+        self._admix_residual_mode = str(cfg.admix_residual_mode or "shared")
+        if self._admix_residual_mode not in {"shared", "per-ancestry"}:
+            raise ValueError("admix_residual_mode must be 'shared' or 'per-ancestry'.")
         cpu_threads = _available_cpu_threads(cfg.cpu_threads)
         use_component_partition = (
             cfg.vc_block_sizes is not None
@@ -451,6 +457,7 @@ class InfinitesimalREMLFitter:
             if not np.isfinite(weights).all() or np.any(weights < -1e-6):
                 raise ValueError("admix_weights must contain finite nonnegative ancestry proportions.")
             weights = np.maximum(weights, 0.0).astype(np.float32, copy=False)
+            self._admix_weights = jax.device_put(jnp.asarray(weights), self.streamers[0].dev)
             self._admix_sqrt_weights = jax.device_put(jnp.sqrt(jnp.asarray(weights)), self.streamers[0].dev)
             if cfg.admix_component_names is None:
                 self._admix_component_names = tuple(
@@ -635,8 +642,9 @@ class InfinitesimalREMLFitter:
                 )
             if self._admix_sqrt_weights is not None:
                 logger.info(
-                    "admixed covariance mode enabled n_components=%d names=%s",
+                    "admixed covariance mode enabled n_components=%d residual_mode=%s names=%s",
                     int(self._admix_sqrt_weights.shape[1]),
+                    self._admix_residual_mode,
                     list(self._admix_component_names),
                 )
             if len(self.streamers) > 1 and not self._has_sparse:
@@ -668,14 +676,13 @@ class InfinitesimalREMLFitter:
     ) -> jnp.ndarray:
         if var_components_init is not None:
             theta0 = np.asarray(var_components_init, dtype=np.float32).reshape(-1)
-            if theta0.size == n_components + 1:
-                theta_g = theta0[:-1]
-            elif theta0.size == n_components:
+            if theta0.size >= n_components:
                 theta_g = theta0
+                if theta0.size > n_components:
+                    theta_g = theta0[:n_components]
             else:
                 raise ValueError(
-                    f"var_components_init length mismatch: expected {n_components} or "
-                    f"{n_components + 1}, got {theta0.size}."
+                    f"var_components_init length mismatch: expected at least {n_components}, got {theta0.size}."
                 )
             theta_g = np.maximum(theta_g, 0.0)
         else:
@@ -704,6 +711,18 @@ class InfinitesimalREMLFitter:
             return jnp.zeros((0,), dtype=jnp.float32)
         return jnp.stack(atoms).astype(jnp.float32)
 
+    def _projected_core_residual_diag_atoms(
+        self,
+        residual_diag_list: Sequence[jnp.ndarray] | None,
+    ) -> jnp.ndarray:
+        if residual_diag_list is None:
+            return jnp.ones((1,), dtype=jnp.float32)
+        atoms = []
+        for d in residual_diag_list:
+            darr = jnp.asarray(d, dtype=jnp.float32)
+            atoms.append(jnp.mean(darr.reshape(-1)))
+        return jnp.stack(atoms).astype(jnp.float32)
+
     def _build_projected_core_precond(
         self,
         *,
@@ -711,6 +730,7 @@ class InfinitesimalREMLFitter:
         diag_list: Sequence[jnp.ndarray],
         weighted_hv,
         stacked_kv,
+        residual_diag_list,
         projected_core_atoms,
         var_components_init: Optional[jnp.ndarray],
     ) -> ProjectedCorePrecondConf:
@@ -750,6 +770,10 @@ class InfinitesimalREMLFitter:
         rank = int(U.shape[1])
         eye = jnp.eye(rank, dtype=U.dtype)
         diag_atoms = _ensure_on_device(self._projected_core_diag_atoms(diag_list), dev)
+        residual_diag_atoms = _ensure_on_device(
+            self._projected_core_residual_diag_atoms(residual_diag_list),
+            dev,
+        )
         if self._partitioned_streamer is not None:
             core_atoms = self._partitioned_streamer.build_projected_core_atoms(
                 U,
@@ -775,6 +799,7 @@ class InfinitesimalREMLFitter:
             n_grm=G,
             diag_mode="scalar_identity",
             diag_atoms=diag_atoms,
+            residual_diag_atoms=residual_diag_atoms,
             identity=eye,
         )
         self.precond_conf = conf
@@ -794,6 +819,7 @@ class InfinitesimalREMLFitter:
         if self._admix_sqrt_weights is not None:
             st = self.streamers[0]
             sqrt_w = self._admix_sqrt_weights
+            weights = self._admix_weights
             G = int(sqrt_w.shape[1])
 
             def _weighted_kv(V, component_idx, st=st, sqrt_w=sqrt_w):
@@ -825,11 +851,25 @@ class InfinitesimalREMLFitter:
                 V_dev = _ensure_on_device(V, st.dev)
                 squeeze = V_dev.ndim == 1
                 V_work = V_dev[:, None] if squeeze else V_dev
-                acc = (
-                    jnp.asarray(theta_e, dtype=V_work.dtype) * V_work
-                    if theta_e is not None
-                    else jnp.zeros_like(V_work)
-                )
+                if theta_e is None:
+                    acc = jnp.zeros_like(V_work)
+                else:
+                    theta_e_arr = jnp.asarray(theta_e, dtype=V_work.dtype)
+                    if theta_e_arr.ndim == 0 or int(theta_e_arr.size) == 1:
+                        acc = theta_e_arr.reshape(()) * V_work
+                    else:
+                        if int(theta_e_arr.shape[0]) != G:
+                            raise ValueError(
+                                f"theta_e must be scalar or length {G} for admixed covariance mode."
+                            )
+                        if weights is None:
+                            raise ValueError("admix weights are unavailable for per-ancestry residual mode.")
+                        residual_diag = jnp.tensordot(
+                            theta_e_arr,
+                            jnp.asarray(weights, dtype=V_work.dtype),
+                            axes=([0], [1]),
+                        )
+                        acc = residual_diag[:, None] * V_work
                 for component_idx in range(G):
                     w = sqrt_w[:, component_idx].astype(V_work.dtype)
                     acc = acc + theta_g_arr[component_idx].astype(V_work.dtype) * (
@@ -840,11 +880,18 @@ class InfinitesimalREMLFitter:
             def stacked_kv(V):
                 return jnp.stack([_weighted_kv(V, component_idx) for component_idx in range(G)], axis=0)
 
+            residual_diag_list = None
+            if self._admix_residual_mode == "per-ancestry":
+                if weights is None:
+                    raise ValueError("admix weights are unavailable for per-ancestry residual mode.")
+                residual_diag_list = tuple(weights[:, component_idx] for component_idx in range(G))
+
             return _OperatorBundle(
                 K_mvs=K_mvs,
                 diag_list=diag_list,
                 weighted_hv=weighted_hv,
                 stacked_kv=stacked_kv,
+                residual_diag_list=residual_diag_list,
                 projected_core_atoms=None,
             )
 
@@ -1185,6 +1232,7 @@ class InfinitesimalREMLFitter:
                 diag_list=ops.diag_list,
                 weighted_hv=ops.weighted_hv,
                 stacked_kv=ops.stacked_kv,
+                residual_diag_list=ops.residual_diag_list,
                 projected_core_atoms=ops.projected_core_atoms,
                 var_components_init=var_components_init,
             )
@@ -1208,6 +1256,7 @@ class InfinitesimalREMLFitter:
                 diag_list=ops.diag_list,
                 weighted_hv=ops.weighted_hv,
                 stacked_kv=ops.stacked_kv,
+                residual_diag_list=ops.residual_diag_list,
                 projected_core_atoms=ops.projected_core_atoms,
                 var_components_init=jnp.asarray(param, dtype=jnp.float32),
             )
@@ -1592,6 +1641,7 @@ class InfinitesimalREMLFitter:
                 precond_eps=self.cfg.pcg_ridge,
                 weighted_hv=ops.weighted_hv,
                 stacked_kv=ops.stacked_kv,
+                residual_diag_list=ops.residual_diag_list,
                 optimizer=(
                     self.cfg.smile_optimizer
                     if self._smile_operators else "strict"

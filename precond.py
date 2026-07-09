@@ -22,6 +22,7 @@ class ProjectedCorePrecondConf:
     n_grm: int
     diag_mode: Optional[str] = None        # MVP: "scalar_identity"
     diag_atoms: Optional[Array] = None
+    residual_diag_atoms: Optional[Array] = None
     identity: Optional[Array] = None
 
 
@@ -104,7 +105,17 @@ def scalar_diag_from_precond_conf(
         diag_atoms = jnp.ones((precond_conf.n_grm,), dtype=theta_g.dtype)
     else:
         diag_atoms = jnp.asarray(precond_conf.diag_atoms, dtype=theta_g.dtype)
-    return jnp.asarray(theta_e, dtype=theta_g.dtype) + jnp.dot(theta_g, diag_atoms)
+    theta_e_arr = jnp.asarray(theta_e, dtype=theta_g.dtype).reshape(-1)
+    if precond_conf.residual_diag_atoms is None:
+        residual_atoms = jnp.ones((theta_e_arr.shape[0],), dtype=theta_g.dtype)
+    else:
+        residual_atoms = jnp.asarray(precond_conf.residual_diag_atoms, dtype=theta_g.dtype).reshape(-1)
+        if int(residual_atoms.shape[0]) != int(theta_e_arr.shape[0]):
+            raise ValueError(
+                "Projected-core residual_diag_atoms length mismatch: "
+                f"expected {int(theta_e_arr.shape[0])}, got {int(residual_atoms.shape[0])}."
+            )
+    return jnp.dot(theta_e_arr, residual_atoms) + jnp.dot(theta_g, diag_atoms)
 
 
 def build_projected_core_runtime(

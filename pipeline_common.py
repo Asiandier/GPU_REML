@@ -233,6 +233,7 @@ def run_planner(
     ring_depth: Optional[int] = None,
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
+    requested_call_width: Optional[int] = None,
 ) -> PlanResult:
     """Run GPU planner and return a PlanResult."""
     plan = suggest_call_width(
@@ -250,6 +251,7 @@ def run_planner(
         ring_depth=ring_depth,
         source_format=source_format,
         arbitrary_component_partition=arbitrary_component_partition,
+        requested_call_width=requested_call_width,
     )
     if not plan.feasible:
         raise SystemExit(
@@ -263,14 +265,127 @@ def print_planner_info(
     gpu_free: Optional[float],
     call_width: int,
 ) -> None:
-    logger.info(
-        "Planner: call_width=%d precond_rank=%d gpu_budget=%.1fGiB "
-        "gpu_live_peak=%.1fGiB ring_depth=%d "
-        "host_anon~%.1fGiB (ring=%.1fGiB) %s",
-        call_width, plan.precond_rank, plan.gpu_budget_gib,
-        plan.gpu_peak_gib, plan.ring_depth,
-        plan.host_anon_est_gib, plan.host_ring_gib, plan.note,
+    free_gib = (
+        f"{float(gpu_free) / 1024**3:.1f}GiB"
+        if gpu_free is not None
+        else "unknown"
     )
+    logger.info(
+        "Planner compute: call_width=%d precond_rank=%d ring_depth=%d",
+        call_width,
+        plan.precond_rank,
+        plan.ring_depth,
+    )
+    logger.info(
+        "GPU memory plan (active allocations): estimated_peak=%.1fGiB "
+        "budget=%.1fGiB device=%s free_at_start=%s",
+        plan.gpu_peak_gib,
+        plan.gpu_budget_gib,
+        gpu_name or "unknown",
+        free_gib,
+    )
+    logger.info(
+        "GPU phase estimates: build=%.1fGiB precompute=%.1fGiB "
+        "solve=%.1fGiB projection=%.1fGiB slq=%.1fGiB",
+        plan.gpu_precond_build_peak_gib,
+        plan.gpu_precompute_peak_gib,
+        plan.gpu_steady_peak_gib,
+        plan.gpu_projection_peak_gib,
+        plan.gpu_slq_peak_gib,
+    )
+    if plan.gpu_allocator_pool_limit_gib > 0.0:
+        logger.info(
+            "GPU allocator capacity: %.1fGiB (pool limit, not planned usage)",
+            plan.gpu_allocator_pool_limit_gib,
+        )
+    logger.info(
+        "Host memory plan (CPU RAM, not GPU VRAM): estimated_total=%.1fGiB "
+        "streaming_ring=%.1fGiB",
+        plan.host_anon_est_gib,
+        plan.host_ring_gib,
+    )
+    if plan.source_build_chunk_width > 0:
+        logger.info(
+            "Source build plan: chunk_width=%d chunks=%d live_memory~%.2fGiB",
+            plan.source_build_chunk_width,
+            plan.source_build_chunks,
+            plan.source_build_est_gib,
+        )
+
+
+def log_runtime_gpu_memory(plan: PlanResult) -> Optional[dict[str, float]]:
+    """Log allocator peaks and compare active use with the planner estimate.
+
+    JAX's pooled allocator distinguishes bytes currently assigned to live
+    arrays from bytes retained by the pool for reuse.  ``nvidia-smi`` normally
+    sees the retained pool plus CUDA context/workspace allocations, so it is
+    expected to track the reserved value more closely than the active value.
+    """
+    try:
+        device = jax.devices("gpu")[0]
+        raw_stats = device.memory_stats() or {}
+    except (RuntimeError, IndexError, AttributeError, TypeError, ValueError):
+        logger.debug("JAX GPU memory telemetry is unavailable.", exc_info=True)
+        return None
+
+    gib = float(1024**3)
+
+    def _as_gib(key: str) -> float:
+        value = raw_stats.get(key, 0)
+        try:
+            return max(0.0, float(value)) / gib
+        except (TypeError, ValueError):
+            return 0.0
+
+    stats = {
+        "current_active_gib": _as_gib("bytes_in_use"),
+        "peak_active_gib": _as_gib("peak_bytes_in_use"),
+        "current_reserved_gib": _as_gib("bytes_reserved"),
+        "peak_reserved_gib": _as_gib("peak_bytes_reserved"),
+        "allocator_limit_gib": _as_gib("bytes_limit"),
+    }
+    if max(stats.values()) <= 0.0:
+        logger.debug("JAX GPU memory telemetry returned no byte counters.")
+        return None
+
+    if stats["peak_reserved_gib"] > 0.0:
+        logger.info(
+            "GPU memory actual (JAX allocator): peak_active=%.1fGiB "
+            "peak_reserved=%.1fGiB current_active=%.1fGiB "
+            "current_reserved=%.1fGiB",
+            stats["peak_active_gib"],
+            stats["peak_reserved_gib"],
+            stats["current_active_gib"],
+            stats["current_reserved_gib"],
+        )
+    else:
+        logger.info(
+            "GPU memory actual (JAX allocator): peak_active=%.1fGiB "
+            "current_active=%.1fGiB reserved_peak=unavailable",
+            stats["peak_active_gib"],
+            stats["current_active_gib"],
+        )
+    logger.info(
+        "GPU memory comparison: planner_active_peak=%.1fGiB "
+        "active_budget=%.1fGiB allocator_limit=%.1fGiB",
+        plan.gpu_peak_gib,
+        plan.gpu_budget_gib,
+        stats["allocator_limit_gib"],
+    )
+
+    tolerance_gib = max(0.5, 0.05 * plan.gpu_budget_gib)
+    if stats["peak_reserved_gib"] > plan.gpu_budget_gib + tolerance_gib:
+        logger.info(
+            "GPU allocator note: the pooled allocator retained %.1fGiB above "
+            "the active budget for reuse. nvidia-smi includes retained memory "
+            "and CUDA overhead; this does not mean all of it was active at "
+            "once. To reduce visible VRAM use, lower --gpu-budget-gib. For "
+            "memory diagnostics, XLA_PYTHON_CLIENT_ALLOCATOR=platform releases "
+            "buffers eagerly but can be slower.",
+            stats["peak_reserved_gib"] - plan.gpu_budget_gib,
+        )
+
+    return stats
 
 
 # ---------------------------------------------------------------------------

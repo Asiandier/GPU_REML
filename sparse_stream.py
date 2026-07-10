@@ -12,6 +12,7 @@ from .block_backend import Sparse12BlockDescriptor
 from .geno_stream import (
     GenoBlockStreamer,
     _ensure_on_device,
+    _numba_thread_mask,
     _stats_and_transcode_raw_bed_numba,
     _stats_from_raw_bed_numba,
 )
@@ -478,6 +479,42 @@ def _col_positions(col_count: np.ndarray) -> tuple[np.ndarray, int]:
 
 
 @njit(cache=True, nogil=True, parallel=True)
+def _row_weighted_sum_from_csc_numba(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    vals: np.ndarray,
+    b: np.ndarray,
+    mean: np.ndarray,
+    n_rows: int,
+    n_parts: int,
+    col_offset: int,
+    encoded_int8: bool,
+) -> np.ndarray:
+    """Compute ``sum_j sparse_value[i,j] * b[j]`` without nnz-sized floats."""
+    partial = np.zeros((n_parts, n_rows), dtype=np.float64)
+    nnz = rows.shape[0]
+    for part in prange(n_parts):
+        lo = (nnz * part) // n_parts
+        hi = (nnz * (part + 1)) // n_parts
+        local = partial[part]
+        for idx in range(lo, hi):
+            row = int(rows[idx])
+            col = int(cols[idx]) - col_offset
+            value = np.float32(vals[idx])
+            if encoded_int8 and vals[idx] == np.int8(3):
+                value = mean[col]
+            local[row] += np.float32(value * b[col])
+
+    out = np.zeros(n_rows, dtype=np.float32)
+    for row in prange(n_rows):
+        total = 0.0
+        for part in range(n_parts):
+            total += partial[part, row]
+        out[row] = np.float32(total)
+    return out
+
+
+@njit(cache=True, nogil=True, parallel=True)
 def _raw_bed_sparse_counts_stats_numba(
     bed_raw: np.ndarray,
     snp_start: int,
@@ -761,7 +798,7 @@ def _build_sparse_meta_from_raw_bed_single_pass(
         "nnz_miss": int(nnz_miss),
         "has_missing": bool(int(nnz_miss) > 0),
     }
-    return meta, mean, inv_sd, eff_inc
+    return meta, mean, inv_sd, eff_inc, cnt
 
 
 class SparseGenoBlockStreamer(GenoBlockStreamer):
@@ -1040,7 +1077,9 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
                 csc_all_vals = np.empty((0,), dtype=np.float32)
             if csc_all_rows.size:
                 csc_all_rows_l.append(csc_all_rows)
-                csc_all_cols_l.append(csc_all_cols + np.int32(local_off))
+                if local_off:
+                    csc_all_cols += np.int32(local_off)
+                csc_all_cols_l.append(csc_all_cols)
                 csc_all_vals_l.append(np.asarray(csc_all_vals))
             has_csr_entries = bool(csr_het_rows.size or csr_hom_rows.size or csr_miss_rows.size)
             if csr_het_rows.size:
@@ -1062,19 +1101,24 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
                     minlength=n,
                 ).astype(np.float32, copy=False)
             if not has_csr_entries and csc_all_rows.size:
-                csc_all_vals_f = np.asarray(csc_all_vals, dtype=np.float32)
-                if np.asarray(csc_all_vals).dtype == np.int8:
-                    miss = np.asarray(csc_all_vals) == np.int8(3)
-                    if np.any(miss):
-                        csc_all_vals_f = csc_all_vals_f.copy()
-                        csc_all_vals_f[miss] = mean[csc_all_cols.astype(np.intp, copy=False)[miss]]
-                row_b += np.bincount(
-                    csc_all_rows.astype(np.intp, copy=False),
-                    weights=(
-                        csc_all_vals_f * b_blk[csc_all_cols.astype(np.intp, copy=False)]
+                n_parts = max(
+                    1,
+                    min(
+                        int(self._build_threads),
+                        max(1, int(csc_all_rows.size) // 1_000_000),
                     ),
-                    minlength=n,
-                ).astype(np.float32, copy=False)
+                )
+                row_b += _row_weighted_sum_from_csc_numba(
+                    csc_all_rows,
+                    csc_all_cols,
+                    np.asarray(csc_all_vals),
+                    b_blk,
+                    mean,
+                    n,
+                    n_parts,
+                    int(local_off),
+                    bool(np.asarray(csc_all_vals).dtype == np.int8),
+                )
 
         def _cat(xs: list[np.ndarray]) -> np.ndarray:
             if not xs:
@@ -1126,9 +1170,10 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
             ranges.append((start, int(self._n_calls)))
 
         host_build_t0 = time.perf_counter()
-        self._sparse_kv_shard_hosts = [
-            self._build_sparse_exec_from_call_range(lo, hi) for lo, hi in ranges
-        ]
+        with _numba_thread_mask(self._build_threads):
+            self._sparse_kv_shard_hosts = [
+                self._build_sparse_exec_from_call_range(lo, hi) for lo, hi in ranges
+            ]
         host_build_elapsed = time.perf_counter() - host_build_t0
         for host in self._sparse_kv_shard_hosts:
             _assert_sparse_exec_index_dtypes(host)
@@ -1279,7 +1324,13 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
     ):
         if int(true_width) <= 0:
             return None
-        meta, mean, inv_sd, eff_inc = _build_sparse_meta_from_raw_bed_single_pass(
+        (
+            meta,
+            mean,
+            inv_sd,
+            eff_inc,
+            observed_counts,
+        ) = _build_sparse_meta_from_raw_bed_single_pass(
             bed_raw,
             int(snp_off),
             int(true_width),
@@ -1288,7 +1339,7 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
             sample_bit_shifts,
         )
         self._attach_sparse_block_meta(meta, mean, inv_sd)
-        return mean, inv_sd, eff_inc
+        return mean, inv_sd, eff_inc, observed_counts
 
     def kv(
         self,

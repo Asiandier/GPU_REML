@@ -14,6 +14,7 @@ where Z_c is the standardised genotype slice for call c.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Callable, Sequence
 
 import numpy as np
@@ -30,7 +31,9 @@ def _device_put_block(block: np.ndarray, dev) -> Array:
     if getattr(dev, "platform", None) == "cpu":
         return jax.device_put(block, dev)
     if isinstance(block, _PinnedHostBuffer):
-        return jax.device_put(np.asarray(block), dev)
+        device_array = jax.device_put(np.asarray(block), dev)
+        block.mark_device_transfer(device_array)
+        return device_array
     return jax.device_put(np.array(block, copy=True, order="C"), dev)
 
 
@@ -88,7 +91,7 @@ def _unpack_impute_center(g_dev_packed, true_width, means_call,
     return diff, inv_f
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(6,))
 def _kv_one_call_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
     true_width: Array,     # () int32, number of valid SNP columns
@@ -101,12 +104,16 @@ def _kv_one_call_jit(
     """Accumulate one call-block contribution from packed 2-bit genotypes."""
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
-    inner = diff.T @ V
+    inner = jnp.matmul(diff.T, V, precision=jax.lax.Precision.HIGHEST)
     inv_sq = inv_f * inv_f
-    return acc + diff @ (inv_sq[:, None] * inner)
+    return acc + jnp.matmul(
+        diff,
+        inv_sq[:, None] * inner,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(7,))
 def _kv_one_call_scaled_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
     true_width: Array,     # () int32, number of valid SNP columns
@@ -120,12 +127,16 @@ def _kv_one_call_scaled_jit(
     """Accumulate one scaled call-block contribution from packed genotypes."""
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
-    inner = diff.T @ V
+    inner = jnp.matmul(diff.T, V, precision=jax.lax.Precision.HIGHEST)
     inv_sq = inv_f * inv_f
-    return acc + scale * (diff @ (inv_sq[:, None] * inner))
+    return acc + scale * jnp.matmul(
+        diff,
+        inv_sq[:, None] * inner,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(7,))
 def _kv_one_call_snp_weighted_jit(
     g_dev_packed: Array,
     true_width: Array,
@@ -139,10 +150,14 @@ def _kv_one_call_snp_weighted_jit(
     """Accumulate one call-block contribution with per-SNP kernel weights."""
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
-    inner = diff.T @ V
+    inner = jnp.matmul(diff.T, V, precision=jax.lax.Precision.HIGHEST)
     inv_sq = inv_f * inv_f
     weighted_inv_sq = weights_call[: diff.shape[1]].astype(V.dtype) * inv_sq
-    return acc + diff @ (weighted_inv_sq[:, None] * inner)
+    return acc + jnp.matmul(
+        diff,
+        weighted_inv_sq[:, None] * inner,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
 
 @jax.jit
@@ -157,10 +172,14 @@ def _xtv_one_call_jit(
     """Compute one call-block contribution for X^T @ V from packed genotypes."""
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
-    return inv_f[:, None] * (diff.T @ V)
+    return inv_f[:, None] * jnp.matmul(
+        diff.T,
+        V,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(0,))
 def _xtv_scatter_jit(out: Array, block_out: Array, snp_off: Array) -> Array:
     """Write one call-block X^T @ V result into the full output matrix."""
     return jax.lax.dynamic_update_slice(out, block_out, (snp_off, 0))
@@ -169,7 +188,11 @@ def _xtv_scatter_jit(out: Array, block_out: Array, snp_off: Array) -> Array:
 @jax.jit
 def _xtx_from_block_jit(block_out: Array) -> Array:
     """Compute one projected Gram contribution from X_c^T U."""
-    return block_out.T @ block_out
+    return jnp.matmul(
+        block_out.T,
+        block_out,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
 
 def _finalize_projected_core_atom(
@@ -211,7 +234,35 @@ def _zxb_one_call_jit(
     width = diff.shape[1]
     cmask = (jnp.arange(width, dtype=true_width.dtype) < true_width).astype(fp)
     b_f = b_call[:width].astype(fp) * cmask
-    return diff @ (inv_f * b_f)
+    return jnp.matmul(
+        diff,
+        inv_f * b_f,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+
+
+@jax.jit
+def _zxb_multi_one_call_jit(
+    g_dev_packed: Array,
+    true_width: Array,
+    means_call: Array,
+    inv_call: Array,
+    b_call: Array,
+    miss_u8: Array,
+) -> Array:
+    """Compute one block of predictions for several effects sharing a stream."""
+    fp = b_call.dtype
+    diff, inv_f = _unpack_impute_center(
+        g_dev_packed, true_width, means_call, inv_call, b_call, miss_u8
+    )
+    width = diff.shape[1]
+    cmask = (jnp.arange(width, dtype=true_width.dtype) < true_width).astype(fp)
+    b_f = b_call[:width, :].astype(fp) * cmask[:, None]
+    return jnp.matmul(
+        diff,
+        inv_f[:, None] * b_f,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
 
 def kv_impl_streamed(
@@ -549,6 +600,65 @@ def zxb_impl_streamed(
             comp_outs[comp_idx] = comp_outs[comp_idx] + block_out
 
     return total, tuple(comp_outs)
+
+
+def zxb_impl_same_stream_multi(
+    b_by_call_stack: Array,
+    true_widths: Array,
+    means_by_call: Array,
+    inv_by_call: Array,
+    *,
+    n: int,
+    n_calls: int,
+    pop_block: Callable[[int], np.ndarray],
+    missing_val: int = 3,
+) -> tuple[Array, tuple[Array, ...]]:
+    """Predict several components that share one genotype stream in one pass.
+
+    ``b_by_call_stack`` has shape ``(components, calls, unpack_width)``. Each
+    packed genotype block is transferred and decoded once, then multiplied by
+    all component effect columns together.
+    """
+    if b_by_call_stack.ndim != 3:
+        raise ValueError(
+            "zxb_impl_same_stream_multi expects shape "
+            "(n_components, n_calls, max_unpack_width)."
+        )
+    n_components = int(b_by_call_stack.shape[0])
+    if n_components <= 0:
+        raise ValueError("zxb_impl_same_stream_multi requires at least one component.")
+    if int(b_by_call_stack.shape[1]) != int(n_calls):
+        raise ValueError(
+            f"zxb_impl_same_stream_multi call mismatch: expected {int(n_calls)}, "
+            f"got {int(b_by_call_stack.shape[1])}."
+        )
+
+    fp = b_by_call_stack.dtype
+    dev = next(iter(b_by_call_stack.devices()))
+    miss_u8 = jnp.asarray(np.uint8(missing_val), dtype=jnp.uint8)
+    component_matrix = jnp.zeros((n, n_components), dtype=fp)
+    if n_calls == 0:
+        components = tuple(component_matrix[:, idx] for idx in range(n_components))
+        return jnp.sum(component_matrix, axis=1), components
+
+    g_dev_next = _device_put_block(pop_block(0), dev)
+    for c in range(n_calls):
+        g_dev_cur = g_dev_next
+        if c + 1 < n_calls:
+            g_dev_next = _device_put_block(pop_block(c + 1), dev)
+        b_call = jnp.swapaxes(b_by_call_stack[:, c, :], 0, 1)
+        component_matrix = component_matrix + _zxb_multi_one_call_jit(
+            g_dev_cur,
+            true_widths[c],
+            means_by_call[c],
+            inv_by_call[c],
+            b_call,
+            miss_u8,
+        )
+        del g_dev_cur
+
+    components = tuple(component_matrix[:, idx] for idx in range(n_components))
+    return jnp.sum(component_matrix, axis=1), components
 
 
 def zxb_impl_multi_streamed(
@@ -1174,7 +1284,6 @@ def build_projected_core_atoms_multi_streamed(
 
     return _stack_leading_axis(cores)
 
-
 def build_projected_core_atoms_partitioned(
     U: Array,
     streamer: object,
@@ -1228,17 +1337,3 @@ def build_projected_core_atoms_partitioned(
         )
 
     return _stack_leading_axis(cores)
-
-
-# ======================================================================
-# Helpers (unchanged interface)
-# ======================================================================
-
-def build_packed_stats(
-    means_flat: Array,
-    inv_flat: Array,
-    pad_width: int,
-) -> tuple[Array, Array]:
-    """Right-pad stats so dynamic_slice is always in-bounds."""
-    pad = jnp.zeros(pad_width, dtype=means_flat.dtype)
-    return jnp.concatenate([means_flat, pad]), jnp.concatenate([inv_flat, pad])

@@ -58,6 +58,7 @@ class PlanResult:
     gpu_streamer_state_gib: float = 0.0
     gpu_precond_state_gib: float = 0.0
     gpu_allocator_pool_limit_gib: float = 0.0
+    smile_w_device_cache_bytes: Optional[float] = None
     source_build_chunk_width: int = 0
     source_build_chunks: int = 0
     source_build_est_gib: float = 0.0
@@ -137,6 +138,11 @@ def _mat_bytes(rows: int, cols: int) -> float:
     return float(_F32 * rows * cols)
 
 
+def _kvrand_cache_bytes(n: int, n_grm: int, n_rand_vec: int) -> float:
+    """Bytes held by the persistent ``K_i @ Vrand`` cache."""
+    return float(n_grm) * _mat_bytes(n, n_rand_vec)
+
+
 def _dense_streamer_state_bytes(
     n: int,
     segment_sizes: Sequence[int],
@@ -145,12 +151,10 @@ def _dense_streamer_state_bytes(
     n_grm: int,
 ) -> tuple[float, _CallGeometry]:
     geom = _build_call_geometry(segment_sizes, call_width)
-    m_total = sum(int(p) for p in segment_sizes)
     means_by_call = 2.0 * _mat_bytes(geom.n_calls, geom.max_unpack_width)
-    means_padded = 2.0 * float(_F32 * (m_total + geom.max_unpack_width))
     geom_arrays = float(2 * geom.n_calls * _I32)
     eff_consts = float((n_grm + 1) * _F32)
-    streamer_bytes = means_by_call + means_padded + geom_arrays + eff_consts
+    streamer_bytes = means_by_call + geom_arrays + eff_consts
     return streamer_bytes, geom
 
 
@@ -237,6 +241,7 @@ def _solve_live_bytes(
     warm_vec = _mat_bytes(n, solve_cols)
     return (
         _projected_core_state_bytes(n, n_grm, rank)
+        + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + geom.inflight_packed_row_bytes * n
         + wide_block
         + 2.0 * inner
@@ -257,7 +262,6 @@ def _precompute_live_bytes(
     wide_block = _mat_bytes(n, geom.max_unpack_width)
     inner = _mat_bytes(geom.max_unpack_width, n_rand_vec)
     vrand = _mat_bytes(n, n_rand_vec)
-    kvrand = float(n_grm) * vrand
     rhs_const = _mat_bytes(n, warm_cols)
     return (
         _projected_core_state_bytes(n, n_grm, rank)
@@ -265,7 +269,7 @@ def _precompute_live_bytes(
         + wide_block
         + 2.0 * inner
         + vrand
-        + kvrand
+        + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + rhs_const
     )
 
@@ -282,12 +286,14 @@ def _projection_live_bytes(
     warm_cols = n_covar + 1 + n_rand_vec
     proj_cols = n_rand_vec + 1
     wide_block = _mat_bytes(n, geom.max_unpack_width)
-    inner = _mat_bytes(geom.max_unpack_width, proj_cols)
+    # PYstar keeps [Py | PZrand], but genetic matvecs now apply only to Py.
+    inner = _mat_bytes(geom.max_unpack_width, 1)
     py = _mat_bytes(n, proj_cols)
-    gpy = float(n_grm + 1) * py
+    gpy = float(n_grm + 1) * _mat_bytes(n, 1)
     sol = _mat_bytes(n, warm_cols)
     return (
         _projected_core_state_bytes(n, n_grm, rank)
+        + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + geom.inflight_packed_row_bytes * n
         + wide_block
         + 2.0 * inner
@@ -303,6 +309,7 @@ def _slq_live_bytes(
     *,
     n_grm: int,
     rank: int,
+    n_rand_vec: int,
     slq_samples: int,
 ) -> float:
     wide_block = _mat_bytes(n, geom.max_unpack_width)
@@ -310,6 +317,7 @@ def _slq_live_bytes(
     slq_vec = _mat_bytes(n, slq_samples)
     return (
         _projected_core_state_bytes(n, n_grm, rank)
+        + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + geom.inflight_packed_row_bytes * n
         + wide_block
         + 2.0 * inner
@@ -394,6 +402,7 @@ def suggest_call_width(
     ring_depth: Optional[int] = None,
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
+    requested_call_width: Optional[int] = None,
 ) -> PlanResult:
     """
     GPU-only planner.
@@ -495,6 +504,7 @@ def suggest_call_width(
             geom,
             n_grm=G,
             rank=precond_rank,
+            n_rand_vec=n_rand_vec,
             slq_samples=max(1, int(slq_samples)),
         )
         live_peak = max(build_peak, precompute_peak, solve_peak, projection_peak, slq_peak)
@@ -509,27 +519,42 @@ def suggest_call_width(
             live_peak,
         )
 
-    lo = _W_ALIGN
-    hi = _align_down_256(p_cap)
-    best_w = _W_ALIGN
-    best_state = _estimate_live_peaks(best_w)
-    if best_state[-1] > gpu_budget:
-        gpu_feasible = False
-        w = best_w
-        streamer_state, precond_state, gpu_precond_build_peak, gpu_precompute_peak, gpu_steady_peak, gpu_projection_peak, gpu_slq_peak, gpu_peak = best_state
+    if requested_call_width is not None:
+        if int(requested_call_width) <= 0:
+            raise ValueError("requested_call_width must be positive when provided.")
+        w = min(int(p_cap), int(requested_call_width))
+        best_state = _estimate_live_peaks(w)
+        gpu_feasible = best_state[-1] <= gpu_budget
     else:
-        gpu_feasible = True
-        while lo <= hi:
-            mid = _align_down_256((lo + hi) // 2)
-            state = _estimate_live_peaks(mid)
-            if state[-1] <= gpu_budget:
-                best_w = mid
-                best_state = state
-                lo = mid + _W_ALIGN
-            else:
-                hi = mid - _W_ALIGN
-        w = best_w
-        streamer_state, precond_state, gpu_precond_build_peak, gpu_precompute_peak, gpu_steady_peak, gpu_projection_peak, gpu_slq_peak, gpu_peak = best_state
+        lo = _W_ALIGN
+        hi = _align_down_256(p_cap)
+        best_w = _W_ALIGN
+        best_state = _estimate_live_peaks(best_w)
+        if best_state[-1] > gpu_budget:
+            gpu_feasible = False
+            w = best_w
+        else:
+            gpu_feasible = True
+            while lo <= hi:
+                mid = _align_down_256((lo + hi) // 2)
+                state = _estimate_live_peaks(mid)
+                if state[-1] <= gpu_budget:
+                    best_w = mid
+                    best_state = state
+                    lo = mid + _W_ALIGN
+                else:
+                    hi = mid - _W_ALIGN
+            w = best_w
+    (
+        streamer_state,
+        precond_state,
+        gpu_precond_build_peak,
+        gpu_precompute_peak,
+        gpu_steady_peak,
+        gpu_projection_peak,
+        gpu_slq_peak,
+        gpu_peak,
+    ) = best_state
 
     scratch = max(0.0, gpu_steady_peak - streamer_state - precond_state)
     target_width = int(p_cap) if component_block_sizes is not None else max(_W_ALIGN, _align_down_256(p_cap))

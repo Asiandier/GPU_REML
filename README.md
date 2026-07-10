@@ -30,18 +30,19 @@ where
 
 $$P(\theta)=V(\theta)^{-1}-V(\theta)^{-1}X\left(X^TV(\theta)^{-1}X\right)^{-1}X^TV(\theta)^{-1}.$$
 
-Each `K_g` is a genotype-defined covariance component. With components
-normalized to a comparable per-sample scale, SNP heritability is estimated from
-the fitted variance components, for example
+Each `K_g` is a genotype-defined covariance component. Let
+`a_g = tr(K_g) / n` and `b_j = tr(R_j) / n` denote average diagonal atoms. SNP
+heritability is estimated from sample-average variance contributions:
 
 $$
 h^2 =
-\frac{\sigma_1^2 + \cdots + \sigma_G^2}
-{\sigma_1^2 + \cdots + \sigma_G^2 + \sigma_e^2}
+\frac{\sum_g \theta_g a_g}
+{\sum_g \theta_g a_g + \sum_j \eta_j b_j}
 $$
 
-and the individual `sigma_g^2` terms describe how genetic variance is allocated
-across the chosen genomic components.
+For unit-trace kernels and one identity residual this reduces to the familiar
+ratio of raw variance-component sums. The trace-weighted form is required for
+admixed components and effective-rank SMILE normalization.
 
 The computational obstacle is that the natural GRM representation is dense:
 constructing, storing, and repeatedly factorizing `n x n` kernels becomes the
@@ -72,9 +73,11 @@ the sample-space kernel:
 
 $$K_g=\frac{X_gW_gX_g^T}{c_g},\quad W_g=\mathrm{blockdiag}(W_{g,1},\ldots,W_{g,B}),\quad c_g=\frac{\mathrm{tr}(X_gW_gX_g^T)}{n}$$
 
-Each `W_{g,i}` is treated as an arbitrary dense block. Blocks inside one GRM are
-summed into one variance component; multiple GRM groups can be supplied when a
-multi-component REML model is desired.
+Each `W_{g,i}` must be a finite symmetric positive-semidefinite dense block.
+GPU_REML treats this as a trusted-input contract and does not run a cubic-time
+PSD check. Blocks inside one GRM are summed into one variance component;
+multiple GRM groups can be supplied when a multi-component REML model is
+desired.
 
 The sparse fixed-effect path uses the fitted covariance `V(theta)` to define a
 penalized GLS likelihood over candidate SNP effects:
@@ -339,7 +342,9 @@ print(result.var_components)
 
 Lower-level users can call `fit_reml` with custom `K @ V` operators and diagonal
 atoms. This makes it possible to prototype new covariance representations
-without rewriting the REML optimizer.
+without rewriting the REML optimizer. The supplied fixed-effect matrix is used
+exactly as given, so low-level callers should include an intercept when their
+model requires one and remove linearly dependent columns.
 
 ## How It Works
 
@@ -355,6 +360,7 @@ evaluation then combines:
 - block PCG solves for `H^-1 [X | y | random probes]`;
 - Hutchinson probes for trace terms in the score;
 - stochastic Lanczos quadrature for `log|H|`;
+- one-pass affine Lanczos reuse for the single-GRM identity-residual model;
 - projected Fisher / AI-style variance-component updates with nonnegative
   genetic-variance constraints;
 - a projected-core preconditioner `dI + U C(theta) U.T` that captures leading
@@ -368,18 +374,38 @@ partitioned, and sparse paths.
 For routine runs, the most important user-facing resource controls are the GPU
 budget and the genotype-streaming ring depth.
 
+See [the mathematical overview](docs/mathematical_overview.md) for the score,
+AI, trace, SLQ, preconditioner, and heritability formulas, and
+[the architecture guide](docs/architecture.md) for module boundaries and the
+fit lifecycle.
+
 ## Key Runtime Parameters
 
-- `--gpu-budget-gib`: planner-side GPU memory budget. This is the main knob for
-  controlling GPU memory peak. The planner uses it to choose the streamed SNP
-  call width and the size of GPU-resident work arrays, including REML random
-  probe blocks and projected-core state. If omitted or set to `0`, GPU_REML uses
-  the currently available GPU memory estimate.
+- `--gpu-budget-gib`: planner-side budget for **active** GPU allocations. The
+  planner uses it to choose the streamed SNP call width and the size of
+  GPU-resident work arrays, including REML random-probe blocks and
+  projected-core state. If omitted or set to `0`, GPU_REML uses 85% of the
+  currently available GPU memory estimate. This is not a hard `nvidia-smi`
+  process-memory cap: JAX's pooled allocator can retain inactive blocks for
+  reuse, and CUDA also owns context/workspace memory. GPU_REML reports the JAX
+  `peak_active` value and, when the backend exposes it, `peak_reserved` at the
+  end of every CLI run so users can distinguish real live use from allocator
+  retention. Lower this budget to leave more VRAM for other processes. For memory diagnostics,
+  `XLA_PYTHON_CLIENT_ALLOCATOR=platform` releases allocations eagerly, at a
+  potential performance cost.
 - `--ring-depth`: number of CPU-side staging buffers used for genotype
   streaming. This is the main knob for controlling CPU memory peak during data
   movement. Larger values can give smoother host-to-GPU streaming but allocate
   more pinned/staging memory on the CPU. The default `0` lets the planner choose
   a conservative value.
+- `GPU_REML_MATMUL_PRECISION`: JAX matmul precision policy. The robust default
+  is `highest`; an alternative should be used only after validating numerical
+  agreement on the target GPU.
+
+The startup report labels the pinned streaming ring as `Host memory plan (CPU
+RAM, not GPU VRAM)`. A line such as `streaming_ring=35.4GiB` therefore describes
+host RAM. At shutdown, `peak_active` is the value to compare with the planner's
+active estimate; `peak_reserved` is closer to what `nvidia-smi` observes.
 
 ## Validation
 

@@ -27,6 +27,7 @@ import dataclasses
 import logging
 import mmap
 import os
+import queue
 import threading
 import time
 import numpy as np
@@ -129,6 +130,19 @@ def _unpin_buffer(arr: np.ndarray, dev) -> None:
 class _PinnedHostBuffer(np.ndarray):
     """Numpy ndarray view backed by host memory registered for direct GPU DMA."""
 
+    def __array_finalize__(self, obj) -> None:
+        if obj is None:
+            return
+        self._ring_owner = getattr(obj, "_ring_owner", None)
+        self._ring_slot = getattr(obj, "_ring_slot", None)
+
+    def mark_device_transfer(self, device_array) -> None:
+        """Keep this ring slot read-only until its asynchronous H2D copy finishes."""
+        owner = getattr(self, "_ring_owner", None)
+        slot = getattr(self, "_ring_slot", None)
+        if owner is not None and slot is not None:
+            owner.mark_device_transfer(int(slot), device_array)
+
 
 class _EvictRing:
     """Pinned staging buffers + trail-behind page eviction.
@@ -154,27 +168,68 @@ class _EvictRing:
         self._dev = dev
 
         if depth is not None:
+            if int(depth) <= 0:
+                raise ValueError("ring depth must be positive when provided.")
             self.DEPTH = int(depth)
         self.DEPTH = min(self.DEPTH, max(1, self._n_calls))
         buf_bytes = self._n * self._mpw
         self._bufs = []
         self._pinned = 0
-        for _ in range(self.DEPTH):
+        for slot in range(self.DEPTH):
             buf = np.zeros(buf_bytes, dtype=np.uint8)
             if _pin_buffer(buf, self._dev):
                 buf = buf.view(_PinnedHostBuffer)
+                buf._ring_owner = self
+                buf._ring_slot = slot
                 self._pinned += 1
             self._bufs.append(buf)
         self._ready = [threading.Event() for _ in range(self.DEPTH)]
         self._writable = [threading.Event() for _ in range(self.DEPTH)]
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._transfer_done = [threading.Event() for _ in range(self.DEPTH)]
+        self._transfer_queue: queue.Queue = queue.Queue()
+        self._transfer_thread = threading.Thread(
+            target=self._transfer_releaser,
+            name="gpu-reml-h2d-release",
+            daemon=True,
+        )
+        self._transfer_thread.start()
         for ev in self._writable:
             ev.set()
+        for ev in self._transfer_done:
+            ev.set()
+
+    def _transfer_releaser(self) -> None:
+        """Release pinned slots as soon as their queued H2D copy is complete."""
+        while True:
+            item = self._transfer_queue.get()
+            try:
+                if item is None:
+                    return
+                slot, device_array = item
+                try:
+                    device_array.block_until_ready()
+                except Exception:
+                    logger.exception("Asynchronous genotype H2D transfer failed.")
+                finally:
+                    self._transfer_done[slot].set()
+            finally:
+                self._transfer_queue.task_done()
+
+    def mark_device_transfer(self, slot: int, device_array) -> None:
+        """Register an asynchronous transfer that still reads a pinned slot."""
+        self._transfer_done[slot].clear()
+        self._transfer_queue.put((slot, device_array))
+
+    def _wait_for_transfers(self) -> None:
+        for ev in self._transfer_done:
+            ev.wait()
 
     def start_pass(self, prefill: int = 2):
         """Start worker and optionally pre-fill first N slots before returning."""
         self.finish_pass()
+        self._wait_for_transfers()
         self._stop.clear()
         for ev in self._ready:
             ev.clear()
@@ -238,6 +293,7 @@ class _EvictRing:
         # Release old ring slot (eviction handled by worker)
         if c >= self.DEPTH:
             old_slot = (c - self.DEPTH) % self.DEPTH
+            self._transfer_done[old_slot].wait()
             self._ready[old_slot].clear()
             self._writable[old_slot].set()
 
@@ -250,13 +306,20 @@ class _EvictRing:
     def finish_pass(self):
         self._stop.set()
         for th in self._threads:
-            th.join(timeout=2.0)
+            th.join()
         self._threads = []
         # Don't blanket-DONTNEED — trail-behind already evicted most pages.
         # Keeping residual pages warm avoids cold-start stalls on next pass.
 
     def close(self):
+        if self._bufs is None:
+            return
         self.finish_pass()
+        self._wait_for_transfers()
+        self._transfer_queue.put(None)
+        self._transfer_queue.join()
+        self._transfer_thread.join()
+        self._transfer_thread = None
         if self._bufs is not None:
             for buf in self._bufs:
                 _unpin_buffer(buf, self._dev)
@@ -863,6 +926,35 @@ def _pack_block_varmaj_numba(
 
 
 @njit(cache=True, nogil=True, parallel=True)
+def _accumulate_packed_standardized_diag_numba(
+    packed_block: np.ndarray,
+    true_width: int,
+    means: np.ndarray,
+    inv_sds: np.ndarray,
+    missing_val: int,
+    diag_out: np.ndarray,
+) -> None:
+    """Accumulate per-sample ``sum_j z_ij^2`` from one packed call block."""
+    n_samples = packed_block.shape[0]
+    packed_width = packed_block.shape[1]
+    for sample_idx in prange(n_samples):
+        total = 0.0
+        for packed_idx in range(packed_width):
+            packed = packed_block[sample_idx, packed_idx]
+            snp_base = packed_idx << 2
+            for offset in range(4):
+                snp_idx = snp_base + offset
+                if snp_idx >= true_width:
+                    break
+                genotype = (packed >> np.uint8(offset << 1)) & np.uint8(3)
+                if genotype == missing_val:
+                    continue
+                z = (float(genotype) - float(means[snp_idx])) * float(inv_sds[snp_idx])
+                total += z * z
+        diag_out[sample_idx] += total
+
+
+@njit(cache=True, nogil=True, parallel=True)
 def _stats_and_pack_varmaj_numba(
     block_vm: np.ndarray,
     packed_out: np.ndarray,
@@ -1091,6 +1183,7 @@ class GenoBlockStreamer:
             _ensure_numba_warmup()
         self._ring_depth_cfg = ring_depth
         # ---- Resolve source --------------------------------------------------
+        source_was_supplied = source is not None
         if source is not None and bed_prefix is not None:
             raise ValueError("Provide either source or bed_prefix, not both.")
         if source is None:
@@ -1103,7 +1196,30 @@ class GenoBlockStreamer:
             # sample_mask is now handled inside the source — clear it here
             sample_mask = None
 
+        if source_was_supplied and sample_mask is not None:
+            source_mask = np.asarray(sample_mask, dtype=bool)
+            if source_mask.shape != (int(source.n),):
+                source_full_n = getattr(source, "_n_full", None)
+                source_subset = getattr(source, "_sample_idx", None)
+                already_applied = (
+                    source_full_n is not None
+                    and source_subset is not None
+                    and source_mask.shape == (int(source_full_n),)
+                    and int(np.count_nonzero(source_mask)) == int(source.n)
+                )
+                if already_applied:
+                    # Built-in source objects may already have applied this
+                    # full-source mask before being handed to the streamer.
+                    sample_mask = None
+                else:
+                    raise ValueError(
+                        "sample_mask is incompatible with the supplied source: "
+                        f"mask length={source_mask.size}, selected={int(np.count_nonzero(source_mask))}, "
+                        f"source.n={int(source.n)}."
+                    )
+
         self._source = source
+        self.sample_ids = getattr(source, "sample_ids", None)
         self._variant_prefix = getattr(source, "_bed_prefix", None) or getattr(source, "_pgen_prefix", None)
         self._variant_format = (
             "bed" if getattr(source, "_bed_prefix", None) is not None else
@@ -1113,12 +1229,26 @@ class GenoBlockStreamer:
         self._sample_mask = (
             np.asarray(sample_mask, dtype=bool) if sample_mask is not None else None
         )
+        if self.sample_ids is not None and self._sample_mask is not None:
+            sample_ids = tuple(self.sample_ids)
+            if len(sample_ids) != self._sample_mask.size:
+                raise ValueError(
+                    "sample_ids length is incompatible with sample_mask: "
+                    f"ids={len(sample_ids)}, mask={self._sample_mask.size}."
+                )
+            self.sample_ids = tuple(
+                iid for iid, keep in zip(sample_ids, self._sample_mask) if keep
+            )
 
         self.bed_prefix = bed_prefix  # kept for debug messages / compat
         source_n = source.n
         self.source_m = int(source.m)
         self.n = int(np.sum(self._sample_mask)) if self._sample_mask is not None else source_n
         self.m = int(source.m)
+        if int(self.n) <= 0:
+            raise ValueError("Genotype source must contain at least one selected sample.")
+        if int(self.m) <= 0:
+            raise ValueError("Genotype source must contain at least one variant.")
 
         self._bed_int_missing = source.missing_val
         self._build_threads = max(1, int(build_threads or (os.cpu_count() or 1)))
@@ -1264,14 +1394,6 @@ class GenoBlockStreamer:
         self._count_host = counts_flat if self.keep_host_stats else None
 
         # ---- Device arrays
-        from .kv_impl import build_packed_stats
-        means_padded, inv_padded = build_packed_stats(
-            jnp.asarray(means_flat, dtype=jnp.float32),
-            jnp.asarray(inv_sds_flat, dtype=jnp.float32),
-            self._max_unpack_width,
-        )
-        self._means_padded = jax.device_put(means_padded, self.dev)
-        self._inv_padded   = jax.device_put(inv_padded, self.dev)
         means_by_call = np.zeros((self._n_calls, self._max_unpack_width), dtype=np.float32)
         inv_by_call = np.zeros((self._n_calls, self._max_unpack_width), dtype=np.float32)
         for c in range(self._n_calls):
@@ -1283,7 +1405,20 @@ class GenoBlockStreamer:
         self._inv_by_call = jax.device_put(jnp.asarray(inv_by_call), self.dev)
         self._eff_m_const  = jax.device_put(jnp.asarray(eff, dtype=jnp.float32), self.dev)
         valid_mask = inv_sds_flat > 0.0
+        override_trace_sums = getattr(self, "_override_trace_sums_flat", None)
+        if override_trace_sums is not None:
+            trace_mass = np.asarray(override_trace_sums, dtype=np.float64)
+        elif counts_flat is None:
+            trace_mass = np.full(self.m, self.n, dtype=np.float64)
+        else:
+            trace_mass = np.asarray(counts_flat, dtype=np.float64)
+        self._mean_diag_atom_host = (
+            float(np.sum(trace_mass[valid_mask], dtype=np.float64) / (float(self.n) * eff))
+            if eff > 0.0
+            else 0.0
+        )
         component_eff = np.zeros((self._n_components,), dtype=np.float32)
+        component_mean_diag = np.zeros((self._n_components,), dtype=np.float32)
         component_snp_offsets = np.zeros((self._n_components + 1,), dtype=np.int32)
         np.cumsum(
             np.asarray(self._component_block_sizes, dtype=np.int32),
@@ -1293,8 +1428,15 @@ class GenoBlockStreamer:
             s0 = int(component_snp_offsets[comp_idx])
             s1 = int(component_snp_offsets[comp_idx + 1])
             component_eff[comp_idx] = float(np.count_nonzero(valid_mask[s0:s1]))
+            if component_eff[comp_idx] > 0.0:
+                component_mean_diag[comp_idx] = float(
+                    np.sum(trace_mass[s0:s1][valid_mask[s0:s1]], dtype=np.float64)
+                    / (float(self.n) * float(component_eff[comp_idx]))
+                )
+        self._override_trace_sums_flat = None
         self._component_snp_offsets = component_snp_offsets
         self._component_eff_m_host = component_eff
+        self._component_mean_diag_atoms_host = component_mean_diag
         self._component_eff_m_const = jax.device_put(
             jnp.asarray(component_eff, dtype=jnp.float32), self.dev,
         )
@@ -1322,15 +1464,34 @@ class GenoBlockStreamer:
             means_flat = np.asarray(self._standardization_override[0], dtype=np.float32)
             inv_sds_flat = np.asarray(self._standardization_override[1], dtype=np.float32)
             counts_flat = None
+            self._override_trace_sums_flat = np.zeros(self.m, dtype=np.float64)
             eff = float(np.count_nonzero(inv_sds_flat > 0.0))
             use_precomputed_stats = True
         else:
             means_flat = np.zeros(self.m, dtype=np.float32)
             inv_sds_flat = np.zeros(self.m, dtype=np.float32)
             counts_flat = np.zeros(self.m, dtype=np.int32)
+            self._override_trace_sums_flat = None
             eff = 0.0
             use_precomputed_stats = False
         return means_flat, inv_sds_flat, counts_flat, eff, use_precomputed_stats
+
+    @staticmethod
+    def _standardized_sumsq_from_raw_stats(
+        cnt: np.ndarray,
+        s1: np.ndarray,
+        s2: np.ndarray,
+        mean: np.ndarray,
+        inv_sd: np.ndarray,
+    ) -> np.ndarray:
+        """Return per-SNP sum of squared standardized observed genotypes."""
+        cnt64 = np.asarray(cnt, dtype=np.float64)
+        s1_64 = np.asarray(s1, dtype=np.float64)
+        s2_64 = np.asarray(s2, dtype=np.float64)
+        mean64 = np.asarray(mean, dtype=np.float64)
+        inv64 = np.asarray(inv_sd, dtype=np.float64)
+        centered_ss = s2_64 - 2.0 * mean64 * s1_64 + cnt64 * mean64 * mean64
+        return np.maximum(centered_ss, 0.0) * inv64 * inv64
 
     def _source_build_chunk_width(self) -> int:
         if self._source_build_chunk_width_cfg is not None:
@@ -1486,7 +1647,11 @@ class GenoBlockStreamer:
                     dir=tmp_dir,
                 )
 
-            use_raw_bed_hook = (not write_packed_cache) and self._can_post_build_from_raw_bed()
+            use_raw_bed_hook = (
+                (not write_packed_cache)
+                and self._standardization_override is None
+                and self._can_post_build_from_raw_bed()
+            )
             max_block_bytes = self.n * self._max_packed_width
             pack_buf = None if use_raw_bed_hook else np.zeros(max_block_bytes, dtype=np.uint8)
             means_flat, inv_sds_flat, counts_flat, eff, use_precomputed_stats = (
@@ -1516,9 +1681,24 @@ class GenoBlockStreamer:
                             sample_bit_shifts,
                         )
                         if built is not None:
-                            mean, inv_sd, eff_inc = built
+                            if len(built) == 3:
+                                mean, inv_sd, eff_inc = built
+                                observed_counts = None
+                            elif len(built) == 4:
+                                mean, inv_sd, eff_inc, observed_counts = built
+                            else:
+                                raise ValueError(
+                                    "_build_bed_raw_block must return "
+                                    "(mean, inv_sd, eff) or (mean, inv_sd, eff, counts)."
+                                )
                             self._store_call_stats(
-                                means_flat, inv_sds_flat, counts_flat, snp_off, mean, inv_sd, None,
+                                means_flat,
+                                inv_sds_flat,
+                                counts_flat,
+                                snp_off,
+                                mean,
+                                inv_sd,
+                                observed_counts,
                             )
                             eff += float(eff_inc)
                             handled_raw = True
@@ -1533,16 +1713,39 @@ class GenoBlockStreamer:
                         if use_precomputed_stats:
                             mean = means_flat[snp_off : snp_off + tw]
                             inv_sd = inv_sds_flat[snp_off : snp_off + tw]
+                            cnt = np.zeros(tw, dtype=np.int64)
+                            s1 = np.zeros(tw, dtype=np.int64)
+                            s2 = np.zeros(tw, dtype=np.int64)
                             if packed_view is not None:
-                                _transcode_raw_bed_numba(
+                                _stats_and_transcode_raw_bed_numba(
                                     bed_raw,
                                     snp_off,
                                     tw,
                                     bytes_per_snp,
                                     sample_byte_offsets,
                                     sample_bit_shifts,
+                                    cnt,
+                                    s1,
+                                    s2,
                                     packed_view,
                                 )
+                            else:
+                                _stats_from_raw_bed_numba(
+                                    bed_raw,
+                                    snp_off,
+                                    tw,
+                                    bytes_per_snp,
+                                    sample_byte_offsets,
+                                    sample_bit_shifts,
+                                    cnt,
+                                    s1,
+                                    s2,
+                                )
+                            self._override_trace_sums_flat[snp_off : snp_off + tw] = (
+                                self._standardized_sumsq_from_raw_stats(
+                                    cnt, s1, s2, mean, inv_sd,
+                                )
+                            )
                         else:
                             cnt = np.zeros(tw, dtype=np.int64)
                             s1 = np.zeros(tw, dtype=np.int64)
@@ -1724,24 +1927,33 @@ class GenoBlockStreamer:
                     if cache_idx_selected.size == 0:
                         continue
 
+                    cnt = np.zeros(tw, dtype=np.int64)
+                    s1 = np.zeros(tw, dtype=np.int64)
+                    s2 = np.zeros(tw, dtype=np.int64)
+                    _stats_from_raw_bed_numba(
+                        bed_raw,
+                        int(source_start),
+                        int(tw),
+                        int(bytes_per_snp),
+                        sample_byte_offsets,
+                        sample_bit_shifts,
+                        cnt,
+                        s1,
+                        s2,
+                    )
                     if use_precomputed_stats:
                         mean = np.asarray(means_flat[cache_idx_selected], dtype=np.float32)
                         inv_sd = np.asarray(inv_sds_flat[cache_idx_selected], dtype=np.float32)
-                    else:
-                        cnt = np.zeros(tw, dtype=np.int64)
-                        s1 = np.zeros(tw, dtype=np.int64)
-                        s2 = np.zeros(tw, dtype=np.int64)
-                        _stats_from_raw_bed_numba(
-                            bed_raw,
-                            int(source_start),
-                            int(tw),
-                            int(bytes_per_snp),
-                            sample_byte_offsets,
-                            sample_bit_shifts,
-                            cnt,
-                            s1,
-                            s2,
+                        self._override_trace_sums_flat[cache_idx_selected] = (
+                            self._standardized_sumsq_from_raw_stats(
+                                cnt[selected_mask],
+                                s1[selected_mask],
+                                s2[selected_mask],
+                                mean,
+                                inv_sd,
+                            )
                         )
+                    else:
                         cnt_f = cnt.astype(np.float32)
                         s1_f = s1.astype(np.float32)
                         s2_f = s2.astype(np.float32)
@@ -1887,14 +2099,28 @@ class GenoBlockStreamer:
 
                     block_vm = self._read_call_block_variant_major(c)
                     packed_view = None
+                    if write_packed_cache:
+                        nbytes = self.n * pw
+                        packed_view = pack_buf[:nbytes].reshape(self.n, pw)
+                        packed_view[:] = 0
                     if use_precomputed_stats:
                         mean = means_flat[snp_off : snp_off + tw]
                         inv_sd = inv_sds_flat[snp_off : snp_off + tw]
+                        if packed_view is not None:
+                            cnt, s1_arr, s2_arr = _stats_and_pack_varmaj_numba(
+                                block_vm[:tw, :], packed_view, self._pack_lut_u8, miss_val,
+                            )
+                        else:
+                            cnt, s1_arr, s2_arr = _stats_from_varmaj_numba(
+                                block_vm[:tw, :], miss_val,
+                            )
+                        self._override_trace_sums_flat[snp_off : snp_off + tw] = (
+                            self._standardized_sumsq_from_raw_stats(
+                                cnt, s1_arr, s2_arr, mean, inv_sd,
+                            )
+                        )
                     else:
-                        if write_packed_cache:
-                            nbytes = self.n * pw
-                            packed_view = pack_buf[:nbytes].reshape(self.n, pw)
-                            packed_view[:] = 0
+                        if packed_view is not None:
                             cnt, s1_arr, s2_arr = _stats_and_pack_varmaj_numba(
                                 block_vm[:tw, :], packed_view, self._pack_lut_u8, miss_val,
                             )
@@ -1926,12 +2152,13 @@ class GenoBlockStreamer:
                         miss_val,
                     )
                     if not handled:
-                        nbytes = self.n * pw
-                        packed_view = pack_buf[:nbytes].reshape(self.n, pw)
-                        packed_view[:] = 0
-                        _pack_block_varmaj_numba(
-                            block_vm[:tw, :], packed_view, self._pack_lut_u8,
-                        )
+                        if packed_view is None:
+                            nbytes = self.n * pw
+                            packed_view = pack_buf[:nbytes].reshape(self.n, pw)
+                            packed_view[:] = 0
+                            _pack_block_varmaj_numba(
+                                block_vm[:tw, :], packed_view, self._pack_lut_u8,
+                            )
                         self._post_build_block(c, packed_view, tw, mean, inv_sd)
                     if write_packed_cache:
                         _write_full(tmp_fd, pack_buf[:nbytes])
@@ -2029,6 +2256,18 @@ class GenoBlockStreamer:
                     if use_precomputed_stats:
                         mean = np.asarray(means_flat[cache_idx_selected], dtype=np.float32)
                         inv_sd = np.asarray(inv_sds_flat[cache_idx_selected], dtype=np.float32)
+                        cnt, s1_arr, s2_arr = _stats_from_varmaj_numba(
+                            block_vm[:tw, :], miss_val,
+                        )
+                        self._override_trace_sums_flat[cache_idx_selected] = (
+                            self._standardized_sumsq_from_raw_stats(
+                                cnt[selected_mask],
+                                s1_arr[selected_mask],
+                                s2_arr[selected_mask],
+                                mean,
+                                inv_sd,
+                            )
+                        )
                     else:
                         cnt, s1_arr, s2_arr = _stats_from_varmaj_numba(
                             block_vm[:tw, :], miss_val,
@@ -2267,11 +2506,10 @@ class GenoBlockStreamer:
 
     def close(self) -> None:
         for attr in (
-            "_means_padded", "_inv_padded", "_eff_m_const",
-            "_means_by_call", "_inv_by_call",
+            "_eff_m_const", "_means_by_call", "_inv_by_call",
             "_snp_starts_dev", "_true_widths_dev",
             "_means_host", "_inv_sds_host", "_count_host",
-            "_component_eff_m_const",
+            "_component_eff_m_const", "_exact_diag_dev",
             "_cache_to_source_variant_indices",
             "_call_source_segments",
             "_packed_offsets_host",
@@ -2531,14 +2769,62 @@ class GenoBlockStreamer:
         return g_u8.astype(np.float32, copy=False)
 
     def diag(self) -> jnp.ndarray:
-        return jax.device_put(jnp.ones((self.n,), dtype=jnp.float32), self.dev)
+        """Return the exact mean diagonal atom ``tr(K) / n`` as a scalar."""
+        return jax.device_put(
+            jnp.asarray(self._mean_diag_atom_host, dtype=jnp.float32),
+            self.dev,
+        )
+
+    def exact_diag(self, *, target_block_bytes: int = 256 * 1024 * 1024) -> jnp.ndarray:
+        """Compute and cache the exact sample-wise diagonal of the streamed GRM."""
+        cached = getattr(self, "_exact_diag_dev", None)
+        if cached is not None:
+            return cached
+        eff = float(np.asarray(jax.device_get(self._eff_m_const)))
+        diag_host = np.zeros((self.n,), dtype=np.float64)
+        if eff > 0.0:
+            if (
+                self._packed_offsets is not None
+                and self._packed_buf is not None
+                and self._means_host is not None
+                and self._inv_sds_host is not None
+            ):
+                for call_idx in range(self._n_calls):
+                    start = int(self._call_snp_starts[call_idx])
+                    true_width = int(self._call_true_widths[call_idx])
+                    _accumulate_packed_standardized_diag_numba(
+                        self._packed_block_host(call_idx),
+                        true_width,
+                        self._means_host[start : start + true_width],
+                        self._inv_sds_host[start : start + true_width],
+                        int(self._missing_val),
+                        diag_host,
+                    )
+            else:
+                block_width = max(
+                    1,
+                    int(target_block_bytes)
+                    // max(1, self.n * np.dtype(np.float32).itemsize),
+                )
+                for start in range(0, self.m, block_width):
+                    stop = min(start + block_width, self.m)
+                    cols = np.arange(start, stop, dtype=np.int64)
+                    Z = self.extract_standardized_columns(cols)
+                    diag_host += np.sum(Z * Z, axis=1, dtype=np.float64)
+            diag_host /= eff
+        self._exact_diag_dev = jax.device_put(
+            jnp.asarray(diag_host, dtype=jnp.float32),
+            self.dev,
+        )
+        return self._exact_diag_dev
 
     def component_diag_list(self) -> list[jnp.ndarray]:
-        diag_one = self.diag()
-        diag_zero = jnp.zeros_like(diag_one)
         return [
-            diag_one if float(eff) > 0.0 else diag_zero
-            for eff in self._component_eff_m_host
+            jax.device_put(
+                jnp.asarray(float(atom), dtype=jnp.float32),
+                self.dev,
+            )
+            for atom in self._component_mean_diag_atoms_host
         ]
 
     def build_projected_core_atom(

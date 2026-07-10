@@ -239,10 +239,19 @@ def load_weight_matrix_metadata(
 ) -> dict:
     """Load optional sidecar metadata next to a W file."""
 
-    meta_path = Path(path).with_suffix(".json")
-    if not meta_path.exists():
+    matrix_path = Path(path)
+    candidates = (
+        matrix_path.with_suffix(".json"),
+        matrix_path.with_suffix(".meta.json"),
+    )
+    meta_path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if meta_path is None:
         if required:
-            raise ValueError(f"Missing sidecar JSON metadata for W file {os.fspath(path)!r}.")
+            expected = ", ".join(os.fspath(candidate) for candidate in candidates)
+            raise ValueError(
+                f"Missing sidecar JSON metadata for W file {os.fspath(path)!r}; "
+                f"looked for {expected}."
+            )
         return {}
     try:
         meta = json.loads(meta_path.read_text())
@@ -260,7 +269,7 @@ def validate_weight_matrix(
     *,
     name: str = "W",
 ) -> np.ndarray:
-    """Return a finite, square float32 matrix suitable for SMILE GPU use."""
+    """Return a finite square float32 W matrix supplied by a trusted caller."""
 
     arr = np.asarray(matrix)
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
@@ -409,6 +418,7 @@ class SmileBlockWeightedOperator:
 
         blocks: list[SmileBlockWeight] = []
         raw_diag = np.zeros((int(streamer.n),), dtype=np.float64) if diag_mode == "full" else None
+        raw_trace_per_sample = 0.0
         next_start = 0
         cache_limit = float(device_cache_max_bytes or 0.0)
         raw_widths: list[int] = []
@@ -446,19 +456,21 @@ class SmileBlockWeightedOperator:
 
             if diag_mode == "full":
                 diag_contrib = self._compute_diag_contribution(streamer, W, start=start)
+                kernel_trace_contrib = float(
+                    np.sum(diag_contrib, dtype=np.float64) / float(streamer.n)
+                )
                 if normalization == "kernel_trace":
-                    trace_per_sample = self._compute_trace_per_sample(
-                        diag_contrib,
-                        normalization=normalization,
-                    )
+                    trace_per_sample = kernel_trace_contrib
             else:
                 diag_contrib = None
+                kernel_trace_contrib = self._compute_trace_per_sample_from_block(
+                    streamer,
+                    W,
+                    start=start,
+                )
                 if normalization == "kernel_trace":
-                    trace_per_sample = self._compute_trace_per_sample_from_block(
-                        streamer,
-                        W,
-                        start=start,
-                    )
+                    trace_per_sample = kernel_trace_contrib
+            raw_trace_per_sample += kernel_trace_contrib
             if raw_diag is not None and diag_contrib is not None:
                 raw_diag += diag_contrib
             blocks.append(
@@ -491,7 +503,10 @@ class SmileBlockWeightedOperator:
             normalization=normalization,
         )
         if raw_diag is None:
-            self._diag_host = np.asarray(1.0, dtype=np.float32)
+            self._diag_host = np.asarray(
+                raw_trace_per_sample / float(self.normalizer),
+                dtype=np.float32,
+            )
         else:
             self._diag_host = np.asarray(raw_diag / float(self.normalizer), dtype=np.float32)
         self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
@@ -525,6 +540,7 @@ class SmileBlockWeightedOperator:
 
         blocks: list[SmileBlockWeight] = []
         raw_diag = np.zeros((int(streamer.n),), dtype=np.float64) if diag_mode == "full" else None
+        raw_trace_per_sample = 0.0
         start = 0
         while start < int(streamer.m):
             size = min(block_size, int(streamer.m) - start)
@@ -539,19 +555,21 @@ class SmileBlockWeightedOperator:
                     size=size,
                 )
                 raw_diag += diag_contrib
+                kernel_trace_contrib = float(
+                    np.sum(diag_contrib, dtype=np.float64) / float(streamer.n)
+                )
                 if normalization == "kernel_trace":
-                    trace_per_sample = cls._compute_trace_per_sample(
-                        diag_contrib,
-                        normalization=normalization,
-                    )
+                    trace_per_sample = kernel_trace_contrib
             else:
+                kernel_trace_contrib = cls._compute_trace_per_sample_from_block(
+                    streamer,
+                    None,
+                    start=start,
+                    size=size,
+                )
                 if normalization == "kernel_trace":
-                    trace_per_sample = cls._compute_trace_per_sample_from_block(
-                        streamer,
-                        None,
-                        start=start,
-                        size=size,
-                    )
+                    trace_per_sample = kernel_trace_contrib
+            raw_trace_per_sample += kernel_trace_contrib
             blocks.append(
                 SmileBlockWeight(
                     matrix=None,
@@ -574,7 +592,10 @@ class SmileBlockWeightedOperator:
             normalization=normalization,
         )
         if raw_diag is None:
-            self._diag_host = np.asarray(1.0, dtype=np.float32)
+            self._diag_host = np.asarray(
+                raw_trace_per_sample / float(self.normalizer),
+                dtype=np.float32,
+            )
         else:
             self._diag_host = np.asarray(raw_diag / float(self.normalizer), dtype=np.float32)
         self._diag_dev = jax.device_put(jnp.asarray(self._diag_host), streamer.dev)
@@ -767,8 +788,9 @@ class SmileBlockWeightedOperator:
         """Return kernel diagonal information without forming the dense kernel.
 
         ``diag_mode="full"`` returns the per-sample diagonal.  ``diag_mode="mean"``
-        returns the scalar average diagonal, which is one under kernel-trace
-        normalization and is sufficient for the scalar-identity preconditioner.
+        returns the exact scalar average diagonal. It is one under kernel-trace
+        normalization and generally differs from one under effective-rank
+        normalization.
         """
 
         return self._diag_dev

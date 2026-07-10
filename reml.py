@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional, Sequence
 
@@ -26,11 +27,8 @@ import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
-
-logger = logging.getLogger(__name__)
-
-Array = jnp.ndarray
-FI_SYSTEM_RIDGE = 1e-4
+import scipy.linalg as sla
+from scipy.optimize import nnls
 
 from .pcg import pcg_solve
 from .precond import (
@@ -43,12 +41,20 @@ from .precond import (
     scalar_diag_from_precond_conf,
 )
 
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Dataclass
-# ---------------------------------------------------------------------------
+Array = jnp.ndarray
+FI_SYSTEM_RIDGE = 1e-4
 
-from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class AffineSLQCache:
+    """Lanczos coefficients for ``theta_g K + theta_e I`` log determinants."""
+
+    alphas_k: Array
+    betas_k: Array
+    z_norm_sq: Array
+    nsamples_f: Array
 
 
 @dataclass
@@ -73,6 +79,7 @@ class REMLContext:
     kvrand_stack: Optional[Array] = None
     diag_atoms: Optional[Array] = None
     residual_diag_atoms: Optional[Array] = None
+    affine_slq_cache: Optional[AffineSLQCache] = None
 
 
 @dataclass
@@ -90,6 +97,7 @@ class FisherSolveStats:
     ai_elapsed_sec: float = 0.0
     ws_resolve_count: int = 0
     ws_fixed_total: int = 0
+    ws_released_total: int = 0
     ws_trace: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -100,6 +108,7 @@ class FisherSolveStats:
             "ai_elapsed_sec": float(self.ai_elapsed_sec),
             "ws_resolve_count": int(self.ws_resolve_count),
             "ws_fixed_total": int(self.ws_fixed_total),
+            "ws_released_total": int(self.ws_released_total),
             "ws_trace": str(self.ws_trace),
         }
 
@@ -117,15 +126,72 @@ def _reset_fisher_solve_stats(
 def _reset_fisher_workingset_stats(stats: FisherSolveStats) -> None:
     stats.ws_resolve_count = 0
     stats.ws_fixed_total = 0
+    stats.ws_released_total = 0
     stats.ws_trace = ""
 
 
 def standardize_response(y: Array) -> tuple[Array, Array, Array]:
     """Standardize a phenotype vector using the same convention as fit_reml."""
     y = jnp.asarray(y, dtype=jnp.float32).reshape(-1)
+    if y.size == 0:
+        raise ValueError("Phenotype must contain at least one sample.")
+    if not bool(jnp.all(jnp.isfinite(y))):
+        raise ValueError("Phenotype contains non-finite values.")
     y_mean = jnp.mean(y)
-    y_scale = jnp.std(y) + jnp.asarray(1e-6, dtype=y.dtype)
+    y_std = jnp.std(y)
+    if not bool(jnp.isfinite(y_std)) or float(y_std) <= 0.0:
+        raise ValueError("Phenotype must have positive finite variance.")
+    y_scale = y_std + jnp.asarray(1e-6, dtype=y.dtype)
     return (y - y_mean) / y_scale, y_mean, y_scale
+
+
+def _validate_fixed_effect_design(xmat: Array, *, relative_tol: float = 1e-7) -> None:
+    """Reject zero or numerically dependent fixed-effect columns."""
+    gram = jnp.matmul(
+        xmat.T,
+        xmat,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    gram_host = np.asarray(jax.device_get(gram), dtype=np.float64)
+    norms_sq = np.diag(gram_host)
+    if not np.all(np.isfinite(norms_sq)) or np.any(norms_sq <= 0.0):
+        raise ValueError("covar contains a zero or non-finite fixed-effect column.")
+    norms = np.sqrt(norms_sq)
+    correlation = gram_host / (norms[:, None] * norms[None, :])
+    eigvals = np.linalg.eigvalsh(0.5 * (correlation + correlation.T))
+    if eigvals[0] <= float(relative_tol) * max(float(eigvals[-1]), 1.0):
+        raise ValueError(
+            "covar is rank-deficient or numerically collinear; "
+            "remove redundant fixed-effect columns."
+        )
+
+
+def _mean_diag_atoms(
+    diag_list: Sequence[Array],
+    *,
+    n_samples: Optional[int] = None,
+) -> Array:
+    """Validate component diagonals and return ``tr(K_i) / n``."""
+    atoms = []
+    valid_flags = []
+    for component_idx, diag in enumerate(diag_list):
+        arr = jnp.asarray(diag, dtype=jnp.float32)
+        if arr.ndim not in (0, 1):
+            raise ValueError(
+                f"diag_list[{component_idx}] must be scalar or one-dimensional."
+            )
+        if arr.ndim == 1 and n_samples is not None and int(arr.size) != int(n_samples):
+            raise ValueError(
+                f"diag_list[{component_idx}] length mismatch: "
+                f"expected {int(n_samples)}, got {int(arr.size)}."
+            )
+        atoms.append(arr.reshape(()) if arr.ndim == 0 else jnp.mean(arr.reshape(-1)))
+        valid_flags.append(jnp.all(jnp.isfinite(arr)) & jnp.all(arr >= 0.0))
+    if not atoms:
+        return jnp.zeros((0,), dtype=jnp.float32)
+    if not bool(jnp.all(jnp.stack(valid_flags))):
+        raise ValueError("diag_list entries must contain finite nonnegative values.")
+    return jnp.stack(atoms)
 
 
 def _scalar_diag_from_diag_list(diag_list: Sequence[Array]) -> Optional[Array]:
@@ -174,6 +240,11 @@ def _stable_cho_factor_spd(
     if (not math.isfinite(scale)) or scale <= 0.0:
         scale = 1.0
     eye = jnp.eye(p, dtype=A_sym.dtype)
+
+    chol = jsp.linalg.cho_factor(A_sym, lower=True, check_finite=False)
+    d = jnp.diag(chol[0])
+    if bool(jnp.all(jnp.isfinite(d)) and jnp.all(d > 0)):
+        return chol
 
     for k in range(max_tries):
         jitter = jnp.asarray(base_jitter * scale * (10.0 ** k), dtype=A_sym.dtype)
@@ -260,6 +331,30 @@ def _slq_logdet(
     The Lanczos recurrence arithmetic is fused into `_lanczos_step_jit`
     (one JIT dispatch per Lanczos step instead of 5–7 separate dispatches).
     """
+    cache = _build_affine_slq_cache(
+        Hv_fn,
+        n_dim,
+        key,
+        nsamples=nsamples,
+        m=m,
+    )
+    return _slq_tridiag_logdet_jit(
+        cache.alphas_k,
+        cache.betas_k,
+        cache.z_norm_sq,
+        cache.nsamples_f,
+    )
+
+
+def _build_affine_slq_cache(
+    K_fn: Callable,
+    n_dim: int,
+    key: "jax.random.PRNGKey",
+    *,
+    nsamples: int,
+    m: int,
+) -> AffineSLQCache:
+    """Run Lanczos once for a matrix used in an affine identity pencil."""
     keys_b = jax.random.split(key, nsamples)
     z = jax.vmap(
         lambda k: jax.random.rademacher(k, (n_dim,), dtype=jnp.int32)
@@ -276,7 +371,7 @@ def _slq_logdet(
     beta_prev = jnp.zeros((nsamples,), dtype=jnp.float32)
 
     for i in range(m):
-        w_raw = Hv_fn(v)                                    # kv in Python scope
+        w_raw = K_fn(v)                                     # kv in Python scope
         v_next, alpha, norm_w = _lanczos_step_jit(v, w_raw, prev, beta_prev)
         alpha_list.append(alpha)
         if i < m - 1:
@@ -285,10 +380,38 @@ def _slq_logdet(
         beta_prev = norm_w
         v         = v_next
 
-    alphas = jnp.stack(alpha_list, axis=0)                  # (m, S)
-    betas  = jnp.stack(beta_list,  axis=0)                  # (m-1, S)
+    alphas = jnp.stack(alpha_list, axis=0)                   # (m, S)
+    betas = (
+        jnp.stack(beta_list, axis=0)
+        if beta_list
+        else jnp.empty((0, nsamples), dtype=alphas.dtype)
+    )
+    return AffineSLQCache(
+        alphas_k=alphas,
+        betas_k=betas,
+        z_norm_sq=z_norm_sq,
+        nsamples_f=jnp.asarray(nsamples, dtype=jnp.float32),
+    )
+
+
+def _affine_slq_logdet(
+    cache: AffineSLQCache,
+    theta_g: Array,
+    theta_e: Array,
+) -> Array:
+    """Evaluate cached SLQ for ``theta_g K + theta_e I``.
+
+    Krylov shift/scale invariance gives ``T_H = theta_g T_K + theta_e I``.
+    Therefore this is the same raw-SLQ quadrature as rerunning Lanczos on H,
+    up to floating-point recurrence roundoff.
+    """
+    scale = jnp.asarray(theta_g).reshape(())
+    shift = jnp.asarray(theta_e).reshape(())
     return _slq_tridiag_logdet_jit(
-        alphas, betas, z_norm_sq, jnp.float32(nsamples)
+        scale * cache.alphas_k + shift,
+        scale * cache.betas_k,
+        cache.z_norm_sq,
+        cache.nsamples_f,
     )
 
 
@@ -385,7 +508,7 @@ def _residual_diag_from_components(ctx: REMLContext, theta_e: Array) -> Array:
 def _compute_traces_from_pcg(
     sol_all: Array,
     ctx: REMLContext,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array]:
     """Estimate tr(H⁻¹ R_j) and tr(H⁻¹ K_i) from the PCG solution.
 
     Uses the random vectors already embedded in rhs_const and their
@@ -436,6 +559,48 @@ def _compute_traces_from_pcg(
     return tr_Hinv_R, tr_Hinv_K
 
 
+def _compute_score_traces(
+    ctx: REMLContext,
+    PZrand: Array,
+    Vrand: Array,
+) -> Array:
+    """Estimate ``tr(P K_i)`` and ``tr(P R_j)`` from fixed probes.
+
+    Genetic probe products are cached once as ``K_i @ Vrand``. Symmetry gives
+    ``Vrand.T @ K_i @ PZrand == PZrand.T @ K_i @ Vrand``, so an evaluation only
+    needs fresh genetic matvecs for ``Py`` rather than for all probe columns.
+    """
+    if ctx.kvrand_stack is not None:
+        trace_genetic = jnp.einsum(
+            "nr,inr->i",
+            PZrand,
+            ctx.kvrand_stack,
+            precision=jax.lax.Precision.HIGH,
+        ) / float(ctx.R_rand)
+    else:
+        KPZrand = _apply_genetic_stack(ctx, PZrand)
+        trace_genetic = jnp.einsum(
+            "nr,inr->i",
+            Vrand,
+            KPZrand,
+            precision=jax.lax.Precision.HIGH,
+        ) / float(ctx.R_rand)
+
+    if ctx.residual_diag_stack is None:
+        trace_residual = (
+            jnp.sum(Vrand * PZrand, dtype=PZrand.dtype) / float(ctx.R_rand)
+        )[None]
+    else:
+        trace_residual = jnp.einsum(
+            "nr,en,nr->e",
+            Vrand,
+            ctx.residual_diag_stack,
+            PZrand,
+            precision=jax.lax.Precision.HIGH,
+        ) / float(ctx.R_rand)
+    return jnp.concatenate([trace_genetic, trace_residual], axis=0)
+
+
 def _eval_once(
     ctx: REMLContext,
     pvec: Array,
@@ -483,6 +648,7 @@ def _eval_once(
     use_residual_slq = (
         slq_mode == "projected_core_residual"
         and taylor_logdet is None
+        and ctx.affine_slq_cache is None
         and ctx.precond_conf is not None
         and getattr(ctx.precond_conf, "diag_mode", None) == "scalar_identity"
         and getattr(ctx.precond_conf, "total_rank", 0) > 0
@@ -506,6 +672,7 @@ def _eval_once(
         if M_cur is not None:
             main_resid = rhs_all - Hv(warm_all)
             X0_all = warm_all + M_cur(main_resid)
+            del main_resid
         else:
             X0_all = warm_all
     elif M_cur is not None:
@@ -514,9 +681,17 @@ def _eval_once(
         X0_all = jnp.zeros_like(rhs_all)
 
     # ---- PCG: Python while loop, Hv per iteration in Python scope ----------
-    sol_all, _, k_pcg = pcg_solve(
+    sol_all, main_rel_res, k_pcg = pcg_solve(
         Hv, rhs_all, M=M_cur, tol=minq_tol, maxiter=maxiter, X0=X0_all,
     )
+    del X0_all
+    main_rel_res_host = float(jax.device_get(main_rel_res))
+    if (not math.isfinite(main_rel_res_host)) or main_rel_res_host > minq_tol * 1.05:
+        raise FloatingPointError(
+            "Main REML PCG did not converge: "
+            f"relative residual={main_rel_res_host:.3e}, tolerance={minq_tol:.3e}, "
+            f"iterations={int(k_pcg)}/{int(maxiter)}."
+        )
     warm_all_next = sol_all
 
     # ---- Projection (pure XLA) ---------------------------------------------
@@ -535,26 +710,23 @@ def _eval_once(
 
     PYstar = proj(HinvXyZ[:, ctx.y_col : ctx.rand_stop])
 
-    # K_i(P[y | Z]) and R_j(P[y | Z]) — kv in Python scope for genetic terms.
-    GPYstar_genetic = _apply_genetic_stack(ctx, PYstar)
-    GPYstar_residual = _apply_residual_stack(ctx, PYstar)
-    GPYstar_stack = jnp.concatenate([GPYstar_genetic, GPYstar_residual], axis=0)
-    GPZrand_stack = GPYstar_stack[:, :, 1:]  # (G+E, n, R)
+    # Only K_i(Py) is needed here. Probe products K_i(Vrand) are cached once and
+    # reused below through the symmetric Hutchinson identity.
+    Py = PYstar[:, :1]
+    PZrand = PYstar[:, 1:]
+    GPy_genetic = _apply_genetic_stack(ctx, Py)
+    GPy_residual = _apply_residual_stack(ctx, Py)
+    GPy_stack = jnp.concatenate([GPy_genetic, GPy_residual], axis=0)
     Vrand_cols = ctx.rhs_const[:, ctx.y_col + 1 : ctx.rand_stop]
 
     # ---- REML statistics (pure XLA) ----------------------------------------
     q_sel = jnp.einsum(
         "n,in->i",
-        PYstar[:, 0],
-        GPYstar_stack[:, :, 0],
+        Py[:, 0],
+        GPy_stack[:, :, 0],
         precision=jax.lax.Precision.HIGH,
     )
-    trace_pg_sel = jnp.einsum(
-        "nr,inr->i",
-        Vrand_cols,
-        GPZrand_stack,
-        precision=jax.lax.Precision.HIGH,
-    ) / float(ctx.R_rand)
+    trace_pg_sel = _compute_score_traces(ctx, PZrand, Vrand_cols)
 
     yPy = jnp.dot(ctx.y, PYstar[:, 0])
 
@@ -566,6 +738,12 @@ def _eval_once(
     # ---- SLQ logdet — Python loop, Hv in Python scope ----------------------
     if taylor_logdet is not None:
         logdet = taylor_logdet
+    elif ctx.affine_slq_cache is not None:
+        logdet = _affine_slq_logdet(
+            ctx.affine_slq_cache,
+            theta_g[0],
+            theta_e[0],
+        )
     elif use_residual_slq and precond_runtime is not None:
         logdet = _slq_logdet_projected_core_residual(
             Hv,
@@ -581,11 +759,12 @@ def _eval_once(
     fisher_stats = FisherSolveStats()
     fisher_stats.free_dim = int(ctx.G + ctx.E)
     fisher_stats.frozen_genetic = 0
-    GPy_cols = jnp.swapaxes(GPYstar_stack[:, :, 0], 0, 1)  # (n, G+E)
+    GPy_cols = jnp.swapaxes(GPy_stack[:, :, 0], 0, 1)  # (n, G+E)
     if warm_ai_ready and warm_ai is not None and warm_ai.shape[1] == ctx.G + ctx.E:
         if M_cur is not None:
             ai_resid = GPy_cols - Hv(warm_ai)
             X0_ai = warm_ai + M_cur(ai_resid)
+            del ai_resid
         else:
             X0_ai = warm_ai
     elif M_cur is not None:
@@ -593,9 +772,17 @@ def _eval_once(
     else:
         X0_ai = jnp.zeros_like(GPy_cols)
     ai_t0 = time.perf_counter()
-    HinvGPy, _, k_ai = pcg_solve(
+    HinvGPy, ai_rel_res, k_ai = pcg_solve(
         Hv, GPy_cols, M=M_cur, tol=minq_tol, maxiter=maxiter, X0=X0_ai,
     )
+    del X0_ai
+    ai_rel_res_host = float(jax.device_get(ai_rel_res))
+    if (not math.isfinite(ai_rel_res_host)) or ai_rel_res_host > minq_tol * 1.05:
+        raise FloatingPointError(
+            "Average-information PCG did not converge: "
+            f"relative residual={ai_rel_res_host:.3e}, tolerance={minq_tol:.3e}, "
+            f"iterations={int(k_ai)}/{int(maxiter)}."
+        )
     warm_ai_next = HinvGPy
     fisher_stats.ai_pcg_iters = int(k_ai)
     fisher_stats.ai_elapsed_sec = time.perf_counter() - ai_t0
@@ -627,6 +814,12 @@ def _eval_once(
     )
     grad = 0.5 * (q_sel - trace_pg_sel) / scale
     ll    = -0.5 * (yPy + logdet + logdet_x) / scale
+    if not bool(
+        jnp.isfinite(ll)
+        & jnp.all(jnp.isfinite(grad))
+        & jnp.all(jnp.isfinite(AI))
+    ):
+        raise FloatingPointError("Non-finite REML objective, score, or AI matrix.")
 
     return (
         ll,
@@ -677,19 +870,130 @@ def _apply_fisher_system(FI, vec: Array) -> Array:
     return FI_sym @ vec + ridge * vec
 
 
+def _solve_average_info_bound_qp(
+    param: Array,
+    grad: Array,
+    FI: AverageInfoMatrix,
+    *,
+    lower_step: Array,
+    initial_active: np.ndarray,
+    trial_alpha: float,
+    bound_tol: float,
+) -> tuple[Array, np.ndarray, int, int]:
+    """Solve the dense bound-constrained Fisher QP through NNLS.
+
+    For ``d = lower_step + x`` with ``x >= 0``, the Fisher subproblem is a
+    non-negative quadratic program. If ``H = L L.T`` is the regularized AI
+    matrix, it is equivalent to ``min ||L.T @ x - b||`` where
+    ``L @ b = grad - H @ lower_step``. SciPy's NNLS implementation solves the
+    KKT system with a compiled active-set method, avoiding one JAX compilation
+    for every possible working-set dimension.
+    """
+    param_host, grad_host, mat_host, lower_host = (
+        np.asarray(value, dtype=np.float64)
+        for value in jax.device_get((param, grad, FI.mat, lower_step))
+    )
+    n_param = int(param_host.size)
+    if mat_host.shape != (n_param, n_param):
+        raise ValueError("Average-information matrix shape does not match the parameter vector.")
+    if not (
+        np.all(np.isfinite(grad_host))
+        and np.all(np.isfinite(mat_host))
+        and np.all(np.isfinite(lower_host))
+    ):
+        raise FloatingPointError("Non-finite value in the bound-constrained Fisher system.")
+
+    ridge = float(FI.ridge)
+    if not math.isfinite(ridge) or ridge < 0.0:
+        raise ValueError("Average-information ridge must be finite and nonnegative.")
+    system = 0.5 * (mat_host + mat_host.T)
+    system = system + ridge * np.eye(n_param, dtype=np.float64)
+    scale = float(np.mean(np.abs(np.diag(system))))
+    if not math.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+
+    chol = None
+    solved_system = system
+    for attempt in range(9):
+        jitter = 0.0 if attempt == 0 else 1e-8 * scale * (10.0 ** (attempt - 1))
+        candidate = system if jitter == 0.0 else system + jitter * np.eye(n_param)
+        try:
+            chol = sla.cholesky(candidate, lower=True, check_finite=False)
+            solved_system = candidate
+            break
+        except np.linalg.LinAlgError:
+            continue
+    if chol is None:
+        raise FloatingPointError(
+            "Failed to stabilize the bound-constrained Fisher system."
+        )
+
+    shifted_rhs = grad_host - solved_system @ lower_host
+    nnls_target = sla.solve_triangular(
+        chol,
+        shifted_rhs,
+        lower=True,
+        check_finite=False,
+    )
+    shifted_step, _ = nnls(
+        chol.T,
+        nnls_target,
+        maxiter=max(3 * n_param, 1),
+    )
+
+    param_tol = max(float(bound_tol), 1e-10)
+    active_mask = float(trial_alpha) * shifted_step <= param_tol
+    shifted_step[active_mask] = 0.0
+    step_host = lower_host + shifted_step
+
+    kkt_residual = grad_host - solved_system @ step_host
+    free_mask = ~active_mask
+    kkt_scale = max(1.0, float(np.max(np.abs(grad_host), initial=0.0)))
+    kkt_tol = max(1e-7, 1e-6 * kkt_scale)
+    free_error = float(np.max(np.abs(kkt_residual[free_mask]), initial=0.0))
+    active_error = float(np.max(kkt_residual[active_mask], initial=0.0))
+    if free_error > kkt_tol or active_error > kkt_tol:
+        raise FloatingPointError(
+            "NNLS Fisher solve did not satisfy KKT tolerance: "
+            f"free_error={free_error:.3e}, active_error={active_error:.3e}, "
+            f"tolerance={kkt_tol:.3e}."
+        )
+
+    unconstrained = sla.cho_solve(
+        (chol, True),
+        grad_host,
+        check_finite=False,
+    )
+    would_block = unconstrained < lower_host - param_tol
+    initial_active = np.asarray(initial_active, dtype=bool).reshape(-1)
+    provisional_active = initial_active | would_block
+    fixed_total = int(np.count_nonzero(active_mask & ~initial_active))
+    released_total = int(np.count_nonzero(provisional_active & ~active_mask))
+    return (
+        jnp.asarray(step_host, dtype=param.dtype),
+        active_mask,
+        fixed_total,
+        released_total,
+    )
+
+
 def _solve_reduced_fisher_step(
     param: Array,
     grad: Array,
     FI,
     *,
     n_genetic: int,
-    freeze_mask_np: np.ndarray,
+    active_mask_np: np.ndarray,
     fixed_step: Array,
 ) -> tuple[Array, np.ndarray]:
-    free_g_idx_np = np.flatnonzero(~freeze_mask_np)
-    residual_idx_np = np.arange(n_genetic, int(param.shape[0]), dtype=np.int64)
-    free_idx_np = np.concatenate([free_g_idx_np, residual_idx_np])
+    active_mask_np = np.asarray(active_mask_np, dtype=bool).reshape(-1)
+    if active_mask_np.shape[0] != int(param.shape[0]):
+        raise ValueError("active_mask_np length must match len(param).")
+    free_idx_np = np.flatnonzero(~active_mask_np)
     free_idx = jnp.asarray(free_idx_np, dtype=jnp.int32)
+
+    if free_idx_np.size == 0:
+        return fixed_step, free_idx_np
 
     rhs_f = grad[free_idx] - _apply_fisher_system(FI, fixed_step)[free_idx]
 
@@ -698,7 +1002,7 @@ def _solve_reduced_fisher_step(
             _reset_fisher_solve_stats(
                 FI.stats,
                 free_dim=free_idx_np.shape[0],
-                frozen_genetic=int(np.sum(freeze_mask_np)),
+                frozen_genetic=int(np.sum(active_mask_np[:n_genetic])),
             )
         FI_ff = AverageInfoMatrix(
             mat=FI.mat[free_idx[:, None], free_idx[None, :]],
@@ -729,12 +1033,21 @@ def _projected_gradient_inf_norm_split(
     *,
     n_genetic: int,
     zero_tol: float,
+    residual_floor: float = 0.0,
 ) -> Array:
     theta_g = param[:n_genetic]
     grad_g = grad[:n_genetic]
     zero_tol_arr = jnp.asarray(zero_tol, dtype=param.dtype)
     proj_g = jnp.where(theta_g > zero_tol_arr, grad_g, jnp.maximum(grad_g, 0.0))
-    proj_all = jnp.concatenate([proj_g, grad[n_genetic:]])
+    theta_e = param[n_genetic:]
+    grad_e = grad[n_genetic:]
+    residual_bound = jnp.asarray(residual_floor, dtype=param.dtype)
+    proj_e = jnp.where(
+        theta_e > residual_bound + zero_tol_arr,
+        grad_e,
+        jnp.maximum(grad_e, 0.0),
+    )
+    proj_all = jnp.concatenate([proj_g, proj_e])
     return jnp.max(jnp.abs(proj_all))
 
 
@@ -745,61 +1058,139 @@ def _projected_fisher_direction(
     *,
     n_genetic: Optional[int] = None,
     genetic_zero_tol: float,
+    residual_floor: float = 0.0,
     trial_alpha: float = 1.0,
     workset_log_fn: Optional[Callable[[dict[str, object]], None]] = None,
 ) -> tuple[Array, float, Array]:
     """Projected Fisher-scoring direction via reduced freeze-set resolves.
 
-    The freeze set is recomputed from the current iterate using the KKT rule
-    ``theta_i <= zero_tol and grad_i <= 0``. For a given trial step size
-    ``trial_alpha``, any free genetic component that would cross below zero is
-    added to the freeze set, fixed to hit the boundary exactly at that trial
-    step, and the reduced Newton system is resolved on the remaining free set.
+    The active set is recomputed from the current iterate using KKT signs. For
+    a given ``trial_alpha``, genetic components are bounded below by zero and
+    residual components by ``residual_floor``. Production AI systems are
+    transformed to NNLS and solved by SciPy's compiled active-set method. The
+    reduced JAX working-set loop remains available for plain-array test and
+    diagnostic systems.
     """
     G = int(param.shape[0] - 1) if n_genetic is None else int(n_genetic)
     if G < 0 or G > int(param.shape[0]):
         raise ValueError("n_genetic must be between 0 and len(param).")
-    if isinstance(FI, AverageInfoMatrix) and FI.stats is not None:
-        initial_freeze = np.asarray(
-            _freeze_mask(param[:G], grad[:G], genetic_zero_tol),
-            dtype=bool,
-        )
-        _reset_fisher_solve_stats(
-            FI.stats,
-            free_dim=int(param.shape[0] - np.sum(initial_freeze)),
-            frozen_genetic=int(np.sum(initial_freeze)),
-        )
-        _reset_fisher_workingset_stats(FI.stats)
-    freeze_mask_np = np.asarray(
-        _freeze_mask(param[:G], grad[:G], genetic_zero_tol),
-        dtype=bool,
-    )
+    if residual_floor < 0.0:
+        raise ValueError("residual_floor must be >= 0.")
     if trial_alpha <= 0.0:
         raise ValueError("trial_alpha must be > 0.")
 
-    fixed_step = jnp.zeros_like(param)
-    resolve_idx = 0
+    initial_freeze = np.asarray(
+        _freeze_mask(param[:G], grad[:G], genetic_zero_tol),
+        dtype=bool,
+    )
+    n_param = int(param.shape[0])
+    active_mask_np = np.zeros((n_param,), dtype=bool)
+    active_mask_np[:G] = initial_freeze
+    if G < n_param:
+        residual_at_floor = np.asarray(
+            param[G:] <= jnp.asarray(residual_floor + genetic_zero_tol, dtype=param.dtype),
+            dtype=bool,
+        )
+        residual_nonpositive_grad = np.asarray(grad[G:] <= 0.0, dtype=bool)
+        active_mask_np[G:] = residual_at_floor & residual_nonpositive_grad
 
-    while True:
+    lower_param = jnp.concatenate(
+        [
+            jnp.zeros((G,), dtype=param.dtype),
+            jnp.full((n_param - G,), residual_floor, dtype=param.dtype),
+        ],
+        axis=0,
+    )
+    lower_step = (lower_param - param) / jnp.asarray(trial_alpha, dtype=param.dtype)
+    fixed_step = jnp.where(jnp.asarray(active_mask_np), lower_step, jnp.zeros_like(param))
+
+    if isinstance(FI, AverageInfoMatrix):
+        step_dir, final_active, fixed_total, released_total = (
+            _solve_average_info_bound_qp(
+                param,
+                grad,
+                FI,
+                lower_step=lower_step,
+                initial_active=active_mask_np,
+                trial_alpha=trial_alpha,
+                bound_tol=genetic_zero_tol,
+            )
+        )
+        free_dim = int(np.count_nonzero(~final_active))
+        frozen_genetic = int(np.count_nonzero(final_active[:G]))
+        resolve_str = (
+            f"solver=nnls free={free_dim} freeze={frozen_genetic} "
+            f"add={fixed_total} drop={released_total}"
+        )
+        if FI.stats is not None:
+            _reset_fisher_solve_stats(
+                FI.stats,
+                free_dim=free_dim,
+                frozen_genetic=frozen_genetic,
+            )
+            _reset_fisher_workingset_stats(FI.stats)
+            FI.stats.ws_resolve_count = 1
+            FI.stats.ws_fixed_total = fixed_total
+            FI.stats.ws_released_total = released_total
+            FI.stats.ws_trace = resolve_str
+        if workset_log_fn is not None:
+            workset_log_fn(
+                {
+                    "resolve_idx": 1,
+                    "free_dim": free_dim,
+                    "frozen_genetic": frozen_genetic,
+                    "fixed_this_resolve": fixed_total,
+                    "released_this_resolve": released_total,
+                }
+            )
+        return step_dir, 1.0, jnp.asarray(final_active[:G], dtype=bool)
+
+    resolve_idx = 0
+    max_resolves = max(16, 8 * n_param)
+    primal_tol = max(float(genetic_zero_tol), 1e-8)
+    dual_tol = max(float(genetic_zero_tol), 1e-8)
+
+    while resolve_idx < max_resolves:
         resolve_idx += 1
         step_dir, free_idx_np = _solve_reduced_fisher_step(
             param,
             grad,
             FI,
             n_genetic=G,
-            freeze_mask_np=freeze_mask_np,
+            active_mask_np=active_mask_np,
             fixed_step=fixed_step,
         )
-        theta_trial_g = param[:G] + jnp.asarray(trial_alpha, dtype=param.dtype) * step_dir[:G]
-        violating_np = np.asarray(theta_trial_g < -genetic_zero_tol, dtype=bool) & (~freeze_mask_np)
-        fixed_this_resolve = int(np.sum(violating_np))
+
+        trial_param = param + jnp.asarray(trial_alpha, dtype=param.dtype) * step_dir
+        violation = np.asarray(trial_param - lower_param, dtype=np.float64)
+        violating_np = (violation < -primal_tol) & (~active_mask_np)
+        add_idx = None
+        if np.any(violating_np):
+            candidates = np.flatnonzero(violating_np)
+            add_idx = int(candidates[np.argmin(violation[candidates])])
+
+        release_idx = None
+        if add_idx is None and np.any(active_mask_np):
+            kkt_residual = np.asarray(
+                grad - _apply_fisher_system(FI, step_dir),
+                dtype=np.float64,
+            )
+            release_candidates = np.flatnonzero(active_mask_np & (kkt_residual > dual_tol))
+            if release_candidates.size:
+                release_idx = int(
+                    release_candidates[np.argmax(kkt_residual[release_candidates])]
+                )
+
+        fixed_this_resolve = int(add_idx is not None)
+        released_this_resolve = int(release_idx is not None)
 
         if isinstance(FI, AverageInfoMatrix) and FI.stats is not None:
             FI.stats.ws_resolve_count += 1
             FI.stats.ws_fixed_total += fixed_this_resolve
+            FI.stats.ws_released_total += released_this_resolve
             resolve_str = (
-                f"free={free_idx_np.shape[0]} freeze={int(np.sum(freeze_mask_np))} "
-                f"add={fixed_this_resolve} drop=0"
+                f"free={free_idx_np.shape[0]} freeze={int(np.sum(active_mask_np[:G]))} "
+                f"add={fixed_this_resolve} drop={released_this_resolve}"
             )
             FI.stats.ws_trace = (
                 resolve_str if not FI.stats.ws_trace else f"{FI.stats.ws_trace} -> {resolve_str}"
@@ -807,25 +1198,31 @@ def _projected_fisher_direction(
             _reset_fisher_solve_stats(
                 FI.stats,
                 free_dim=int(free_idx_np.shape[0]),
-                frozen_genetic=int(np.sum(freeze_mask_np)),
+                frozen_genetic=int(np.sum(active_mask_np[:G])),
             )
         if workset_log_fn is not None:
             workset_log_fn(
                 {
                     "resolve_idx": resolve_idx,
                     "free_dim": int(free_idx_np.shape[0]),
-                    "frozen_genetic": int(np.sum(freeze_mask_np)),
+                    "frozen_genetic": int(np.sum(active_mask_np[:G])),
                     "fixed_this_resolve": fixed_this_resolve,
+                    "released_this_resolve": released_this_resolve,
                 }
             )
 
-        if fixed_this_resolve == 0:
-            return step_dir, 1.0, jnp.asarray(freeze_mask_np, dtype=bool)
+        if add_idx is not None:
+            active_mask_np[add_idx] = True
+            fixed_step = fixed_step.at[add_idx].set(lower_step[add_idx])
+            continue
+        if release_idx is not None:
+            active_mask_np[release_idx] = False
+            fixed_step = fixed_step.at[release_idx].set(0.0)
+            continue
 
-        freeze_mask_np = np.logical_or(freeze_mask_np, violating_np)
-        violating_idx = jnp.asarray(np.flatnonzero(violating_np), dtype=jnp.int32)
-        boundary_step = -param[violating_idx] / jnp.asarray(trial_alpha, dtype=param.dtype)
-        fixed_step = fixed_step.at[violating_idx].set(boundary_step)
+        return step_dir, 1.0, jnp.asarray(active_mask_np[:G], dtype=bool)
+
+    raise RuntimeError("Bound-constrained Fisher active set failed to converge.")
 
 
 def _apply_projected_step(
@@ -902,12 +1299,32 @@ def fit_reml(
     The returned variance components and history therefore live on the
     standardized phenotype scale. Higher-level wrappers are responsible for
     carrying ``y_mean``/``y_scale`` when outputs need to be interpreted back on
-    the original phenotype scale.
+    the original phenotype scale. ``covar`` is used exactly as supplied;
+    low-level callers must include an intercept when it is part of the intended
+    fixed-effect model.
     """
-    n = y.shape[0]
+    y = jnp.asarray(y, dtype=jnp.float32).reshape(-1)
+    n = int(y.shape[0])
+    if n <= 0:
+        raise ValueError("fit_reml requires at least one phenotype sample.")
+    K_mvs = tuple(K_mvs)
+    diag_list = tuple(diag_list)
     G = len(K_mvs)
     if G != len(diag_list):
         raise ValueError("Length of K_mvs and diag_list must match.")
+    if G == 0:
+        raise ValueError("fit_reml requires at least one genetic covariance component.")
+    if n_rand_vec <= 0:
+        raise ValueError("fit_reml requires n_rand_vec > 0.")
+    if maxiter <= 0:
+        raise ValueError("fit_reml requires maxiter > 0.")
+    if minq_iter < 0:
+        raise ValueError("fit_reml requires minq_iter >= 0.")
+    if slq_m <= 0:
+        raise ValueError("fit_reml requires slq_m > 0.")
+    if not 0.0 <= h2_init <= 1.0:
+        raise ValueError("h2_init must lie in [0, 1].")
+    genetic_trace_atoms = _mean_diag_atoms(diag_list, n_samples=n)
     if residual_diag_list is None:
         residual_diag_stack = None
         residual_diag_atoms = jnp.ones((1,), dtype=jnp.float32)
@@ -928,6 +1345,10 @@ def fit_reml(
             raise ValueError("residual_diag_list contains non-finite values.")
         if bool(jnp.any(residual_diag_stack < 0.0)):
             raise ValueError("residual_diag_list entries must be nonnegative.")
+        if bool(jnp.any(jnp.sum(residual_diag_stack, axis=0) <= 0.0)):
+            raise ValueError(
+                "residual_diag_list must provide positive residual support for every sample."
+            )
         residual_diag_atoms = jnp.mean(residual_diag_stack, axis=1)
         E = int(residual_diag_stack.shape[0])
     if slq_samples <= 0:
@@ -975,11 +1396,19 @@ def fit_reml(
     y, y_mean, y_scale = standardize_response(y)
     y_mean_host, y_scale_host = jax.device_get((y_mean, y_scale))
 
-    xmat = (
-        jnp.asarray(covar, dtype=jnp.float32)
-        if covar is not None and covar.size > 0
-        else None
-    )
+    xmat = None if covar is None else jnp.asarray(covar, dtype=jnp.float32)
+    if xmat is not None and xmat.size == 0:
+        xmat = None
+    if xmat is not None:
+        if xmat.ndim == 1:
+            xmat = xmat[:, None]
+        if xmat.ndim != 2 or int(xmat.shape[0]) != n:
+            raise ValueError("covar must be a 2D matrix with one row per phenotype sample.")
+        if not bool(jnp.all(jnp.isfinite(xmat))):
+            raise ValueError("covar contains non-finite values.")
+        if int(xmat.shape[1]) >= n:
+            raise ValueError("covar must have fewer columns than samples for REML.")
+        _validate_fixed_effect_design(xmat)
 
     if param_init is not None:
         p0 = jnp.asarray(param_init, dtype=jnp.float32).reshape(-1)
@@ -994,8 +1423,19 @@ def fit_reml(
         theta_e0 = jnp.maximum(p0[G:], jnp.asarray(residual_floor, dtype=p0.dtype))
         param = jnp.concatenate([theta_g0, theta_e0], axis=0)
     else:
-        theta_g = jnp.full((G,), h2_init / max(G, 1), dtype=jnp.float32)
-        theta_e = jnp.full((E,), 1.0 - h2_init, dtype=jnp.float32)
+        genetic_trace_sum = jnp.sum(genetic_trace_atoms)
+        if not bool(jnp.isfinite(genetic_trace_sum)) or float(genetic_trace_sum) <= 0.0:
+            raise ValueError("At least one genetic component must have positive average diagonal.")
+        residual_trace_sum = jnp.sum(residual_diag_atoms)
+        if not bool(jnp.isfinite(residual_trace_sum)) or float(residual_trace_sum) <= 0.0:
+            raise ValueError("Residual components must have positive total average diagonal.")
+        theta_g_common = jnp.asarray(h2_init, dtype=jnp.float32) / genetic_trace_sum
+        theta_g = jnp.where(genetic_trace_atoms > 0.0, theta_g_common, 0.0)
+        theta_e = jnp.full(
+            (E,),
+            jnp.asarray(1.0 - h2_init, dtype=jnp.float32) / residual_trace_sum,
+            dtype=jnp.float32,
+        )
         param = jnp.concatenate(
             [jnp.maximum(theta_g, 0.0), jnp.maximum(theta_e, jnp.asarray(residual_floor, dtype=theta_e.dtype))],
             axis=0,
@@ -1006,7 +1446,15 @@ def fit_reml(
     if precond_conf is None or getattr(precond_conf, "diag_mode", None) != "scalar_identity":
         diag_atoms = _scalar_diag_from_diag_list(diag_list)
         need_diag_stack = diag_atoms is None
-    diag_stack = jnp.stack(diag_list, axis=0) if need_diag_stack else None
+    diag_stack = None
+    if need_diag_stack:
+        expanded_diags = []
+        for diag in diag_list:
+            arr = jnp.asarray(diag, dtype=jnp.float32)
+            expanded_diags.append(
+                jnp.full((n,), arr, dtype=jnp.float32) if arr.ndim == 0 else arr
+            )
+        diag_stack = jnp.stack(expanded_diags, axis=0)
     del diag_list
 
     # ---- Precompute K_i @ Vrand — constant across REML iterations ----------
@@ -1022,6 +1470,27 @@ def fit_reml(
         KVrand_stack = jnp.stack([mv(Vrand_fixed) for mv in K_mvs], axis=0)
     if full_log:
         logger.info("[REML] K_i @ Vrand done elapsed=%.1fs", time.time() - _t_kv_cache)
+
+    affine_slq_cache = None
+    if G == 1 and E == 1 and residual_diag_stack is None:
+        if full_log:
+            _t_affine_slq = time.time()
+            logger.info(
+                "[REML] precompute affine single-GRM SLQ (%d Lanczos passes) ...",
+                slq_m,
+            )
+        affine_slq_cache = _build_affine_slq_cache(
+            K_mvs[0],
+            n,
+            key_slq_fixed,
+            nsamples=slq_samples,
+            m=slq_m,
+        )
+        if full_log:
+            logger.info(
+                "[REML] affine single-GRM SLQ done elapsed=%.1fs",
+                time.time() - _t_affine_slq,
+            )
 
     # ---- Cache constant RHS [X | y | Vrand] once ---------------------------
     rhs_parts = []
@@ -1055,6 +1524,7 @@ def fit_reml(
         kvrand_stack=KVrand_stack,
         diag_atoms=diag_atoms,
         residual_diag_atoms=residual_diag_atoms,
+        affine_slq_cache=affine_slq_cache,
     )
     del rhs_parts
     del KVrand_stack
@@ -1153,22 +1623,24 @@ def fit_reml(
                 return
             if trial_count <= 1:
                 logger.info(
-                    "[REML] iter %d workset-resolve %d free=%d freeze=%d fix=%d",
+                    "[REML] iter %d workset-resolve %d free=%d freeze=%d add=%d drop=%d",
                     it + 1,
                     int(info["resolve_idx"]),
                     int(info["free_dim"]),
                     int(info["frozen_genetic"]),
                     int(info["fixed_this_resolve"]),
+                    int(info["released_this_resolve"]),
                 )
             else:
                 logger.info(
-                    "[REML] iter %d trial %d workset-resolve %d free=%d freeze=%d fix=%d",
+                    "[REML] iter %d trial %d workset-resolve %d free=%d freeze=%d add=%d drop=%d",
                     it + 1,
                     trial_count,
                     int(info["resolve_idx"]),
                     int(info["free_dim"]),
                     int(info["frozen_genetic"]),
                     int(info["fixed_this_resolve"]),
+                    int(info["released_this_resolve"]),
                 )
 
         accepted = False
@@ -1214,6 +1686,7 @@ def fit_reml(
                 FI,
                 n_genetic=G,
                 genetic_zero_tol=genetic_zero_tol,
+                residual_floor=residual_floor,
                 trial_alpha=alpha_used,
                 workset_log_fn=_log_workset_resolve,
             )
@@ -1242,7 +1715,11 @@ def fit_reml(
             step_norm, max_rel_dp = (
                 float(v) for v in jax.device_get((step_norm_arr, max_rel_dp_arr))
             )
-            if max_rel_dp < taylor_threshold and logdet_cached is not None:
+            if (
+                optimizer == "smile_scoring"
+                and max_rel_dp < taylor_threshold
+                and logdet_cached is not None
+            ):
                 d_theta_g = delta_param[:G]
                 d_theta_e = delta_param[G:]
                 # This is the cheap first-order update for log|H| only.
@@ -1251,31 +1728,35 @@ def fit_reml(
                 taylor_ld = logdet_cached + jnp.dot(d_theta_g, tr_Hinv_K_cached) + jnp.dot(d_theta_e, tr_Hinv_R_cached)
                 trial_use_taylor = True
 
-            if precond_refresh_fn is not None and precond_refresh_reldp > 0.0:
-                if full_log:
-                    logger.info(
-                        "[REML] iter %d refresh projected_core preconditioner "
-                        "(trial=%d alpha=%.3e)",
-                        it + 1,
-                        trial_count,
-                        alpha_used,
-                    )
-                refreshed = precond_refresh_fn(param_updated)
-                if refreshed is not None:
-                    ctx.precond_conf = refreshed
-                iter_precond_refreshed = True
-
             eval_t0 = time.time()
-            ll_try, grad_try, FI_try, k_pcg_try, warm_try, warm_ai_try, _tr_Hinv_R_try, _tr_Hinv_K_try, logdet_try = _run_eval(
-                param_updated,
-                trial_warm,
-                trial_warm_ai,
-                tol_cur,
-                trial_warm_ready,
-                trial_warm_ai_ready,
-                taylor_logdet_val=taylor_ld,
-                compute_traces=False,
-            )
+            try:
+                (
+                    ll_try,
+                    grad_try,
+                    FI_try,
+                    k_pcg_try,
+                    warm_try,
+                    warm_ai_try,
+                    _tr_Hinv_R_try,
+                    _tr_Hinv_K_try,
+                    logdet_try,
+                ) = _run_eval(
+                    param_updated,
+                    trial_warm,
+                    trial_warm_ai,
+                    tol_cur,
+                    trial_warm_ready,
+                    trial_warm_ai_ready,
+                    taylor_logdet_val=taylor_ld,
+                    compute_traces=False,
+                )
+            except FloatingPointError:
+                eval_elapsed += time.time() - eval_t0
+                if optimizer == "smile_scoring":
+                    raise
+                ls_trace.append((alpha_used, float("-inf"), False, 0, 0, False))
+                alpha_try *= 0.5
+                continue
             eval_elapsed += time.time() - eval_t0
             dll_arr, k_pcg_arr = jax.device_get((ll_try - ll, k_pcg_try))
             dll = float(dll_arr)
@@ -1325,6 +1806,7 @@ def fit_reml(
                     grad_new,
                     n_genetic=G,
                     zero_tol=genetic_zero_tol,
+                    residual_floor=residual_floor,
                 ),
                 delta_param,
                 param_updated,
@@ -1337,6 +1819,40 @@ def fit_reml(
             status = "accept" if dll >= 0.0 else "accept_downhill"
         else:
             status = "ll_down"
+        if accepted:
+            if optimizer == "smile_scoring":
+                should_stop = (not math.isfinite(rel_improve)) or (max_rel_dp < scoring_step_tol)
+            else:
+                first_order_converged = (
+                    float(proj_grad_host) < scoring_step_tol
+                    or max_rel_dp < scoring_step_tol
+                )
+                should_stop = (not math.isfinite(rel_improve)) or (
+                    rel_improve < rel_dll_tol and first_order_converged
+                )
+        else:
+            should_stop = False
+
+        should_refresh_precond = (
+            accepted
+            and not should_stop
+            and precond_refresh_fn is not None
+            and precond_refresh_reldp > 0.0
+            and max_rel_dp >= precond_refresh_reldp
+        )
+        if should_refresh_precond:
+            if full_log:
+                logger.info(
+                    "[REML] iter %d refresh projected_core preconditioner "
+                    "after accepted step (max_reldp=%.3e threshold=%.3e)",
+                    it + 1,
+                    max_rel_dp,
+                    precond_refresh_reldp,
+                )
+            refreshed = precond_refresh_fn(param_updated)
+            if refreshed is not None:
+                ctx.precond_conf = refreshed
+            iter_precond_refreshed = True
         dparam_str  = "[" + ", ".join(f"{float(v):.3e}" for v in np.asarray(delta_param_host).reshape(-1)) + "]"
 
         history.append({
@@ -1374,12 +1890,15 @@ def fit_reml(
             step_ai_pcg = int(step_fisher_stats_dict.get("ai_pcg_iters", 0))
             ws_resolves = int(step_fisher_stats_dict.get("ws_resolve_count", 0))
             ws_fixed_total = int(step_fisher_stats_dict.get("ws_fixed_total", 0))
+            ws_released_total = int(step_fisher_stats_dict.get("ws_released_total", 0))
             ws_trace = str(step_fisher_stats_dict.get("ws_trace", ""))
             step_free_dim = int(step_fisher_stats_dict.get("free_dim", 0))
             step_frozen = int(step_fisher_stats_dict.get("frozen_genetic", 0))
             if trial_count > 1:
                 trace_str = " -> ".join(
-                    f"a={alpha:.3e} dll={dll_i:.3e} pcg={pcg_i} ai_pcg={ai_pcg_i} slq={'taylor' if taylor_i else 'slq'}{'*' if ok else ''}"
+                    f"a={alpha:.3e} dll={dll_i:.3e} pcg={pcg_i} "
+                    f"ai_pcg={ai_pcg_i} "
+                    f"slq={'taylor' if taylor_i else 'slq'}{'*' if ok else ''}"
                     for alpha, dll_i, ok, pcg_i, ai_pcg_i, taylor_i in ls_trace
                 )
                 logger.info("[REML] iter %d line-search %s", it + 1, trace_str)
@@ -1387,13 +1906,14 @@ def fit_reml(
                 "[REML] iter %d/%d status=%s pcg_tol=%.1e\n"
                 "  ll: %.6e -> %.6e  dll=%.3e rel_dll=%.3e\n"
                 "  step: alpha=%.3e/%.3e ls=%d |dparam|=%.3e max_reldp=%.3e step=%.1fs\n"
-                "  workset: free=%d freeze=%d resolves=%d fix_total=%d trace=%s\n"
+                "  workset: free=%d freeze=%d resolves=%d add_total=%d drop_total=%d trace=%s\n"
                 "  solves: step_ai_pcg=%d eval_pcg=%d eval_ai_pcg=%d slq=%s eval=%.1fs iter=%.1fs\n"
                 "  dparam: %s",
                 it + 1, minq_iter, status, tol_cur,
                 float(ll_host), float(ll_new_host), dll, rel_improve,
                 alpha_used, alpha_max, trial_count, step_norm, max_rel_dp, step_elapsed,
-                step_free_dim, step_frozen, ws_resolves, ws_fixed_total, ws_trace if ws_trace else "<none>",
+                step_free_dim, step_frozen, ws_resolves, ws_fixed_total, ws_released_total,
+                ws_trace if ws_trace else "<none>",
                 step_ai_pcg, k_pcg, eval_ai_pcg, slq_tag, eval_elapsed, time.time() - iter_t0,
                 dparam_str,
             )
@@ -1435,10 +1955,6 @@ def fit_reml(
             # freshly computed value; on Taylor iterations, the Taylor estimate
             # becomes the new anchor (it is the best available estimate).
             logdet_cached = logdet_new
-            if optimizer == "smile_scoring":
-                should_stop = (not math.isfinite(rel_improve)) or (max_rel_dp < scoring_step_tol)
-            else:
-                should_stop = (not math.isfinite(rel_improve)) or (rel_improve < rel_dll_tol)
             if should_stop:
                 stop_reason = "scoring_step" if optimizer == "smile_scoring" else "rel_dll"
                 break
@@ -1463,6 +1979,8 @@ def fit_reml(
             "stop_reason": stop_reason,
             "y_mean": y_mean,
             "y_scale": y_scale,
+            "genetic_trace_atoms": genetic_trace_atoms,
+            "residual_trace_atoms": residual_diag_atoms,
         }
         return param, history, diagnostics
     return param, history

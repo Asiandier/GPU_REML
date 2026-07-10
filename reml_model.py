@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import itertools
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Optional, Sequence
@@ -11,8 +13,6 @@ import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 from .geno_stream import BedBlockStreamer, GenoBlockStreamer, _ensure_on_device
 from .pipeline_common import fam_order_mismatch as _fam_order_mismatch
@@ -25,6 +25,10 @@ from .precond import (
     scalar_diag_from_precond_conf,
 )
 from .reml import fit_reml, standardize_response
+
+logger = logging.getLogger(__name__)
+
+_ADMIX_FUSED_RHS_BUDGET = 256
 
 @dataclasses.dataclass
 class FitConfig:
@@ -112,6 +116,11 @@ class FitResult:
     final_grad: Optional[jnp.ndarray] = None
     final_loglik: Optional[float] = None
     diagnostics: Optional[dict[str, object]] = None
+    heritability: Optional[float] = None
+    genetic_trace_atoms: Optional[jnp.ndarray] = None
+    residual_trace_atoms: Optional[jnp.ndarray] = None
+    monte_carlo_se_var: Optional[jnp.ndarray] = None
+    monte_carlo_se_h2: Optional[float] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,6 +131,91 @@ class _OperatorBundle:
     stacked_kv: object
     residual_diag_list: tuple[jnp.ndarray, ...] | None = None
     projected_core_atoms: object | None = None
+
+
+def _variant_metadata_records(prefix: str, source_format: str):
+    """Yield canonical ``(chrom, pos, id, ref, alt)`` variant records."""
+    if source_format == "bed":
+        path = prefix + ".bim"
+        if not os.path.exists(path):
+            raise ValueError(f"Prediction variant metadata is missing: {path!r}.")
+        with open(path) as handle:
+            for line_no, line in enumerate(handle, start=1):
+                cols = line.split()
+                if len(cols) < 6:
+                    raise ValueError(
+                        f"{path}: BIM line {line_no} has fewer than 6 columns."
+                    )
+                # BIM stores A1 (usually ALT) before A2 (usually REF).
+                yield cols[0], cols[3], cols[1], cols[5], cols[4]
+        return
+
+    if source_format != "pgen":
+        raise ValueError(f"Unsupported prediction metadata format: {source_format!r}.")
+    path = prefix + ".pvar"
+    if not os.path.exists(path):
+        compressed = path + ".zst"
+        if os.path.exists(compressed):
+            raise ValueError(
+                "Prediction alignment requires a readable .pvar file; "
+                f"decompress {compressed!r} before prediction."
+            )
+        raise ValueError(f"Prediction variant metadata is missing: {path!r}.")
+    header = None
+    with open(path) as handle:
+        for line_no, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                candidate = stripped.lstrip("#").split()
+                if {"CHROM", "POS", "ID", "REF", "ALT"}.issubset(candidate):
+                    header = {name: candidate.index(name) for name in ("CHROM", "POS", "ID", "REF", "ALT")}
+                continue
+            if header is None:
+                raise ValueError(f"{path}: PVAR header is missing before line {line_no}.")
+            cols = stripped.split()
+            max_idx = max(header.values())
+            if len(cols) <= max_idx:
+                raise ValueError(f"{path}: malformed PVAR row at line {line_no}.")
+            yield (
+                cols[header["CHROM"]],
+                cols[header["POS"]],
+                cols[header["ID"]],
+                cols[header["REF"]],
+                cols[header["ALT"]],
+            )
+
+
+def _validate_variant_metadata_alignment(st_train, st_test, component_idx: int) -> None:
+    train_prefix = getattr(st_train, "_variant_prefix", None)
+    test_prefix = getattr(st_test, "_variant_prefix", None)
+    train_format = getattr(st_train, "_variant_format", None)
+    test_format = getattr(st_test, "_variant_format", None)
+    if train_prefix is None and test_prefix is None:
+        return
+    if train_prefix is None or test_prefix is None or train_format is None or test_format is None:
+        raise ValueError(
+            f"Prediction variant metadata is unavailable for component {component_idx}."
+        )
+    if (
+        train_format == test_format
+        and os.path.abspath(str(train_prefix)) == os.path.abspath(str(test_prefix))
+    ):
+        return
+
+    sentinel = object()
+    train_records = _variant_metadata_records(str(train_prefix), str(train_format))
+    test_records = _variant_metadata_records(str(test_prefix), str(test_format))
+    for variant_idx, (expected, observed) in enumerate(
+        itertools.zip_longest(train_records, test_records, fillvalue=sentinel)
+    ):
+        if expected != observed:
+            raise ValueError(
+                "Prediction variant metadata mismatch for component "
+                f"{component_idx} at source variant {variant_idx}: "
+                f"expected {expected!r}, got {observed!r}."
+            )
 
 
 def _validate_dense_prediction_streamers(
@@ -138,6 +232,7 @@ def _validate_dense_prediction_streamers(
                 f"Prediction SNP count mismatch for component {idx}: "
                 f"expected {int(st_train.m)}, got {int(st_test.m)}."
             )
+        _validate_variant_metadata_alignment(st_train, st_test, idx)
         if int(st_train._n_calls) != int(st_test._n_calls):
             raise ValueError(
                 f"Prediction call geometry mismatch for component {idx}: "
@@ -178,8 +273,6 @@ def _validate_dense_prediction_streamers(
 def _copy_training_standardization_to_test_streamer(train_st, test_st) -> None:
     test_st._means_by_call = _ensure_on_device(train_st._means_by_call, test_st.dev)
     test_st._inv_by_call = _ensure_on_device(train_st._inv_by_call, test_st.dev)
-    test_st._means_padded = _ensure_on_device(train_st._means_padded, test_st.dev)
-    test_st._inv_padded = _ensure_on_device(train_st._inv_padded, test_st.dev)
     test_st._means_host = train_st._means_host
     test_st._inv_sds_host = train_st._inv_sds_host
 
@@ -254,6 +347,39 @@ def _validate_multi_grm_sample_order(prefixes: list[str]) -> None:
                 f"Multi-GRM sample-order mismatch. GRM {i} ({pref}) vs {prefixes[0]}. {mismatch}")
 
 
+def _validate_source_sample_order(sources: Sequence[object]) -> None:
+    """Compare aligned sample IDs when built-in source objects expose them."""
+    reference_ids = None
+    reference_idx = None
+    for idx, source in enumerate(sources):
+        sample_ids = getattr(source, "sample_ids", None)
+        if sample_ids is None:
+            continue
+        ids = tuple(str(iid) for iid in sample_ids)
+        if reference_ids is None:
+            reference_ids = ids
+            reference_idx = idx
+            continue
+        if ids != reference_ids:
+            mismatch = next(
+                (
+                    pos,
+                    reference_ids[pos] if pos < len(reference_ids) else None,
+                    ids[pos] if pos < len(ids) else None,
+                )
+                for pos in range(max(len(reference_ids), len(ids)))
+                if pos >= len(reference_ids)
+                or pos >= len(ids)
+                or reference_ids[pos] != ids[pos]
+            )
+            pos, expected, observed = mismatch
+            raise ValueError(
+                "Genotype source sample-order mismatch: "
+                f"source {idx} vs source {reference_idx} at row {pos}: "
+                f"expected {expected!r}, got {observed!r}."
+            )
+
+
 def _build_parallelism(n_grm: int, cpu_threads: int) -> tuple[int, int]:
     if n_grm <= 1:
         return 1, max(1, cpu_threads)
@@ -320,6 +446,16 @@ class InfinitesimalREMLFitter:
             if cfg.standardization_overrides is not None
             else None
         )
+        configured_sources = list(cfg.sources or ()) + list(cfg.rare_sources or ())
+        _validate_source_sample_order(configured_sources)
+        configured_rare_bed_prefixes = (
+            list(cfg.rare_bed_prefix)
+            if isinstance(cfg.rare_bed_prefix, (list, tuple))
+            else [cfg.rare_bed_prefix]
+        )
+        configured_rare_bed_prefixes = [
+            str(prefix) for prefix in configured_rare_bed_prefixes if prefix
+        ]
 
         if cfg.precond_type != "projected_core":
             raise ValueError(
@@ -390,7 +526,7 @@ class InfinitesimalREMLFitter:
                     component_variant_indices=cfg.component_variant_indices,
                     standardization_override=stats_override,
                     device=cfg.device,
-                    keep_host_stats=(cfg.keep_host_stats or use_smile),
+                    keep_host_stats=(cfg.keep_host_stats or use_smile or use_admixed),
                     build_threads=build_threads,
                     sample_mask=cfg.sample_mask,
                     ring_depth=cfg.ring_depth,
@@ -407,6 +543,7 @@ class InfinitesimalREMLFitter:
         else:
             # ---- BED-prefix path (backward compatible) --------------------
             prefixes = cfg.bed_prefix if isinstance(cfg.bed_prefix, (list, tuple)) else [cfg.bed_prefix]
+            prefixes = [str(prefix) for prefix in prefixes if prefix]
             if use_admixed and len(prefixes) != 1:
                 raise ValueError("Admixed covariance mode requires exactly one dense BED prefix.")
             if use_component_partition and len(prefixes) != 1:
@@ -415,7 +552,9 @@ class InfinitesimalREMLFitter:
                 raise ValueError(
                     "standardization_overrides must match the number of dense BED prefixes."
                 )
-            _validate_multi_grm_sample_order(list(prefixes))
+            _validate_multi_grm_sample_order(
+                list(prefixes) + configured_rare_bed_prefixes
+            )
             n_parallel, build_threads = _build_parallelism(len(prefixes), cpu_threads)
 
             def _build_one(item) -> BedBlockStreamer:
@@ -427,7 +566,7 @@ class InfinitesimalREMLFitter:
                     component_variant_indices=cfg.component_variant_indices,
                     standardization_override=stats_override,
                     device=cfg.device,
-                    keep_host_stats=(cfg.keep_host_stats or use_smile),
+                    keep_host_stats=(cfg.keep_host_stats or use_smile or use_admixed),
                     build_threads=build_threads,
                     sample_mask=cfg.sample_mask,
                     ring_depth=cfg.ring_depth,
@@ -497,12 +636,7 @@ class InfinitesimalREMLFitter:
                 self._has_sparse = True
         elif cfg.rare_bed_prefix:
             from .sparse_stream import SparseGenoBlockStreamer
-            prefixes_r = (
-                cfg.rare_bed_prefix
-                if isinstance(cfg.rare_bed_prefix, (list, tuple))
-                else [cfg.rare_bed_prefix]
-            )
-            prefixes_r = [p for p in prefixes_r if p]
+            prefixes_r = configured_rare_bed_prefixes
             if prefixes_r:
                 n_parallel_r, build_threads_r = _build_parallelism(len(prefixes_r), cpu_threads)
 
@@ -525,6 +659,10 @@ class InfinitesimalREMLFitter:
                 else:
                     self.streamers.extend(_build_sparse_one(pref) for pref in prefixes_r)
                 self._has_sparse = True
+
+        if not self.streamers:
+            raise ValueError("At least one dense or sparse genotype source is required.")
+        _validate_source_sample_order(self.streamers)
 
         self._sparse_streamers = tuple(self.streamers[self._n_dense_streamers:]) if self._has_sparse else ()
         self._sparse_merged_global = None
@@ -730,9 +868,9 @@ class InfinitesimalREMLFitter:
         diag_list: Sequence[jnp.ndarray],
         weighted_hv,
         stacked_kv,
-        residual_diag_list,
         projected_core_atoms,
         var_components_init: Optional[jnp.ndarray],
+        residual_diag_list=None,
     ) -> ProjectedCorePrecondConf:
         if not self.streamers:
             raise RuntimeError("Projected-core preconditioner requires at least one streamer.")
@@ -743,11 +881,16 @@ class InfinitesimalREMLFitter:
                         datetime.now().isoformat(timespec='seconds'))
 
         G = len(K_mvs)
+        dev = self.streamers[0].dev
+        diag_atoms = _ensure_on_device(self._projected_core_diag_atoms(diag_list), dev)
+        residual_diag_atoms = _ensure_on_device(
+            self._projected_core_residual_diag_atoms(residual_diag_list),
+            dev,
+        )
         theta_ref = self._theta_ref_from_var_components(
             n_components=G,
             var_components_init=var_components_init,
         )
-        dev = self.streamers[0].dev
         theta_ref = _ensure_on_device(theta_ref, dev)
 
         if weighted_hv is not None:
@@ -761,7 +904,7 @@ class InfinitesimalREMLFitter:
                 return acc
 
         key = jax.random.PRNGKey(cfg.seed + 4321)
-        U, _ = build_lowrank_basis(
+        U, basis_evals = build_lowrank_basis(
             K_mv=K_ref_mv,
             n=self.streamers[0].n,
             max_rank=cfg.precond_rank,
@@ -769,29 +912,31 @@ class InfinitesimalREMLFitter:
         )
         rank = int(U.shape[1])
         eye = jnp.eye(rank, dtype=U.dtype)
-        diag_atoms = _ensure_on_device(self._projected_core_diag_atoms(diag_list), dev)
-        residual_diag_atoms = _ensure_on_device(
-            self._projected_core_residual_diag_atoms(residual_diag_list),
-            dev,
-        )
-        if self._partitioned_streamer is not None:
-            core_atoms = self._partitioned_streamer.build_projected_core_atoms(
+        if G == 1:
+            # build_lowrank_basis diagonalizes Q.T @ K @ Q and returns
+            # U = Q @ eigenvectors, so U.T @ K @ U is already available.
+            raw_core_atoms = jnp.diag(basis_evals.astype(U.dtype))[None, :, :]
+        elif self._partitioned_streamer is not None:
+            raw_core_atoms = self._partitioned_streamer.build_projected_core_atoms(
                 U,
-                subtract_identity=True,
+                subtract_identity=False,
             )
         else:
             if projected_core_atoms is not None:
-                core_atoms = projected_core_atoms(U)
+                raw_core_atoms = projected_core_atoms(U)
             elif stacked_kv is not None:
                 KU_stack = stacked_kv(U)
-                core_atoms = jnp.einsum("nr,gns->grs", U, KU_stack)
-                core_atoms = 0.5 * (core_atoms + jnp.swapaxes(core_atoms, -1, -2))
-                core_atoms = core_atoms - diag_atoms.astype(U.dtype)[:, None, None] * eye[None, :, :]
+                raw_core_atoms = jnp.einsum("nr,gns->grs", U, KU_stack)
             else:
                 KU_stack = jnp.stack([mv(U) for mv in K_mvs], axis=0)
-                core_atoms = jnp.einsum("nr,gns->grs", U, KU_stack)
-                core_atoms = 0.5 * (core_atoms + jnp.swapaxes(core_atoms, -1, -2))
-                core_atoms = core_atoms - diag_atoms.astype(U.dtype)[:, None, None] * eye[None, :, :]
+                raw_core_atoms = jnp.einsum("nr,gns->grs", U, KU_stack)
+        core_atoms = 0.5 * (
+            raw_core_atoms + jnp.swapaxes(raw_core_atoms, -1, -2)
+        )
+        core_atoms = (
+            core_atoms
+            - diag_atoms.astype(U.dtype)[:, None, None] * eye[None, :, :]
+        )
         conf = ProjectedCorePrecondConf(
             U=U,
             core_atoms=core_atoms,
@@ -837,10 +982,30 @@ class InfinitesimalREMLFitter:
                 (lambda V, component_idx=component_idx: _weighted_kv(V, component_idx))
                 for component_idx in range(G)
             )
+            exact_diag_fn = getattr(st, "exact_diag", None)
+            base_diag = exact_diag_fn() if callable(exact_diag_fn) else st.diag()
             diag_list = tuple(
-                sqrt_w[:, component_idx] * sqrt_w[:, component_idx]
+                base_diag * sqrt_w[:, component_idx] * sqrt_w[:, component_idx]
                 for component_idx in range(G)
             )
+
+            def _component_chunks(V_work, st=st, sqrt_w=sqrt_w):
+                rhs_cols = int(V_work.shape[1])
+                components_per_chunk = max(
+                    1,
+                    min(G, _ADMIX_FUSED_RHS_BUDGET // max(1, rhs_cols)),
+                )
+                for start in range(0, G, components_per_chunk):
+                    stop = min(start + components_per_chunk, G)
+                    w_chunk = sqrt_w[:, start:stop].astype(V_work.dtype)
+                    weighted_rhs = (
+                        w_chunk[:, :, None] * V_work[:, None, :]
+                    ).reshape((int(V_work.shape[0]), (stop - start) * rhs_cols))
+                    base_out = st.kv(weighted_rhs, normalize=True).reshape(
+                        (int(V_work.shape[0]), stop - start, rhs_cols)
+                    )
+                    component_out = w_chunk[:, :, None] * base_out
+                    yield start, stop, jnp.swapaxes(component_out, 0, 1)
 
             def weighted_hv(theta_g, theta_e, V, st=st, sqrt_w=sqrt_w):
                 theta_g_arr = jnp.asarray(theta_g)
@@ -870,15 +1035,22 @@ class InfinitesimalREMLFitter:
                             axes=([0], [1]),
                         )
                         acc = residual_diag[:, None] * V_work
-                for component_idx in range(G):
-                    w = sqrt_w[:, component_idx].astype(V_work.dtype)
-                    acc = acc + theta_g_arr[component_idx].astype(V_work.dtype) * (
-                        w[:, None] * st.kv(w[:, None] * V_work, normalize=True)
+                for start, stop, component_chunk in _component_chunks(V_work):
+                    acc = acc + jnp.einsum(
+                        "g,gnr->nr",
+                        theta_g_arr[start:stop].astype(V_work.dtype),
+                        component_chunk,
+                        precision=jax.lax.Precision.HIGH,
                     )
                 return acc[:, 0] if squeeze else acc
 
             def stacked_kv(V):
-                return jnp.stack([_weighted_kv(V, component_idx) for component_idx in range(G)], axis=0)
+                V_dev = _ensure_on_device(V, st.dev)
+                squeeze = V_dev.ndim == 1
+                V_work = V_dev[:, None] if squeeze else V_dev
+                chunks = [chunk for _start, _stop, chunk in _component_chunks(V_work)]
+                out = jnp.concatenate(chunks, axis=0)
+                return out[:, :, 0] if squeeze else out
 
             residual_diag_list = None
             if self._admix_residual_mode == "per-ancestry":
@@ -971,7 +1143,6 @@ class InfinitesimalREMLFitter:
 
             def projected_core_atoms(U, ops=ops):
                 atoms = []
-                eye = jnp.eye(int(U.shape[1]), dtype=U.dtype)
                 st = ops[0].streamer
                 U_dev = jax.device_put(jnp.asarray(U), st.dev)
                 XtU = st.xtv(U_dev, normalize=False)
@@ -982,8 +1153,7 @@ class InfinitesimalREMLFitter:
                     KU = _kv_from_shared_xtv(op, XtU, int(U_dev.shape[1]), fp, False)
                     atom = jnp.asarray(U_dev, dtype=KU.dtype).T @ KU
                     atom = 0.5 * (atom + atom.T)
-                    diag_atom = jnp.mean(jnp.asarray(op.diag(), dtype=U.dtype).reshape(-1))
-                    atoms.append(atom - diag_atom.astype(U.dtype) * eye)
+                    atoms.append(atom)
                 return jnp.stack(atoms, axis=0)
 
             return _OperatorBundle(
@@ -1016,7 +1186,7 @@ class InfinitesimalREMLFitter:
                 weighted_hv=weighted_hv,
                 stacked_kv=stacked_kv,
                 projected_core_atoms=(
-                    lambda U, st=st: st.build_projected_core_atoms(U, subtract_identity=True)
+                    lambda U, st=st: st.build_projected_core_atoms(U, subtract_identity=False)
                 ),
             )
 
@@ -1154,7 +1324,7 @@ class InfinitesimalREMLFitter:
                             dense_streamers,
                             dense_call_plan,
                             missing_val=int(dense_streamers[0]._missing_val),
-                            subtract_identity=True,
+                            subtract_identity=False,
                         )
                         component_atoms.extend(
                             dense_atoms[g_idx] for g_idx in range(dense_count)
@@ -1163,7 +1333,7 @@ class InfinitesimalREMLFitter:
                         component_atoms.append(
                             dense_streamers[0].build_projected_core_atom(
                                 U_dev,
-                                subtract_identity=True,
+                                subtract_identity=False,
                             )
                         )
 
@@ -1171,7 +1341,7 @@ class InfinitesimalREMLFitter:
                         component_atoms.append(
                             st.build_projected_core_atom(
                                 U_dev,
-                                subtract_identity=True,
+                                subtract_identity=False,
                             )
                         )
                     return _stack_leading_axis(component_atoms)
@@ -1209,7 +1379,7 @@ class InfinitesimalREMLFitter:
                         streamers,
                         call_plan,
                         missing_val=missing_val,
-                        subtract_identity=True,
+                        subtract_identity=False,
                     )
 
         return _OperatorBundle(
@@ -1426,6 +1596,17 @@ class InfinitesimalREMLFitter:
         )
         if not bool(jnp.all(jnp.isfinite(sol))):
             raise FloatingPointError("Non-finite PCG solution encountered in estimate_effects.")
+        rel_res_host = float(jax.device_get(rel_res))
+        if (
+            not np.isfinite(rel_res_host)
+            or rel_res_host > float(self.cfg.effect_pcg_tol) * 1.05
+        ):
+            raise FloatingPointError(
+                "Effect-estimation PCG did not converge: "
+                f"relative residual={rel_res_host:.3e}, "
+                f"tolerance={float(self.cfg.effect_pcg_tol):.3e}, "
+                f"iterations={int(iters)}/{int(self.cfg.max_pcg_iters)}."
+            )
 
         Hinv_y = sol[:, 0]
         if xmat is not None:
@@ -1478,6 +1659,17 @@ class InfinitesimalREMLFitter:
             raise RuntimeError("Prediction requires initialized training and test streamers.")
 
         _validate_dense_prediction_streamers(self.streamers, test_fitter.streamers)
+        if self._partitioned_streamer is not None:
+            expected_effect_components = int(self._partitioned_streamer.n_components)
+        elif self._smile_operators:
+            expected_effect_components = len(self._smile_operators)
+        else:
+            expected_effect_components = len(self.streamers)
+        if len(effects.snp_effects) != expected_effect_components:
+            raise ValueError(
+                "Prediction SNP-effect component count mismatch: "
+                f"expected {expected_effect_components}, got {len(effects.snp_effects)}."
+            )
         for st_train, st_test in zip(self.streamers, test_fitter.streamers):
             _copy_training_standardization_to_test_streamer(st_train, st_test)
 
@@ -1486,6 +1678,12 @@ class InfinitesimalREMLFitter:
             X_test = jnp.asarray(test_covar, dtype=jnp.float32)
             if X_test.ndim == 1:
                 X_test = X_test[:, None]
+            if X_test.ndim != 2 or int(X_test.shape[0]) != int(test_fitter.streamers[0].n):
+                raise ValueError(
+                    "Prediction covariates must be a 2D matrix with one row per test sample."
+                )
+            if not bool(jnp.all(jnp.isfinite(X_test))):
+                raise ValueError("Prediction covariates contain non-finite values.")
         else:
             X_test = None
 
@@ -1528,7 +1726,38 @@ class InfinitesimalREMLFitter:
                 n_components=int(test_st.n_components),
             )
         else:
-            if len(self.streamers) > 1:
+            if self._smile_operators:
+                from .kv_impl import zxb_impl_same_stream_multi
+
+                if len(effects.snp_effects) != len(self._smile_operators):
+                    raise ValueError(
+                        "SMILE prediction effect count mismatch: "
+                        f"expected {len(self._smile_operators)}, got {len(effects.snp_effects)}."
+                    )
+                st_train = self.streamers[0]
+                st_test = test_fitter.streamers[0]
+                st_test._prepare_kv_pass()
+                b_by_call_stack = jnp.stack(
+                    [
+                        _build_b_by_call(
+                            st_train,
+                            jnp.asarray(b, dtype=jnp.float32).reshape(-1),
+                        )
+                        for b in effects.snp_effects
+                    ],
+                    axis=0,
+                )
+                random_effect, random_components = zxb_impl_same_stream_multi(
+                    b_by_call_stack,
+                    st_test._true_widths_dev,
+                    st_test._means_by_call,
+                    st_test._inv_by_call,
+                    n=int(st_test.n),
+                    n_calls=int(st_test._n_calls),
+                    pop_block=st_test._pop_cached,
+                    missing_val=int(st_test._missing_val),
+                )
+            elif len(self.streamers) > 1:
                 from .kv_impl import zxb_impl_multi_streamed
 
                 train_streamers = tuple(self.streamers)
@@ -1614,6 +1843,12 @@ class InfinitesimalREMLFitter:
 
         ops = self._assemble_reml_operators()
         self._ensure_projected_core_precond_ready(ops, var_components_init=var_components_init)
+        genetic_trace_atoms = self._projected_core_diag_atoms(ops.diag_list)
+        residual_trace_atoms = self._projected_core_residual_diag_atoms(
+            ops.residual_diag_list
+        )
+        G = len(ops.K_mvs)
+        E = int(residual_trace_atoms.shape[0])
 
         reps = []
         diagnostics = None
@@ -1661,20 +1896,42 @@ class InfinitesimalREMLFitter:
         rep_var_components = None
         jackknife_se_var = None
         jackknife_se_h2 = None
+        monte_carlo_se_var = None
+        monte_carlo_se_h2 = None
+
+        def _trace_weighted_h2(theta_values: jnp.ndarray) -> jnp.ndarray:
+            theta_values = jnp.asarray(theta_values)
+            genetic = theta_values[..., :G] @ genetic_trace_atoms
+            residual = theta_values[..., G : G + E] @ residual_trace_atoms
+            return genetic / jnp.maximum(genetic + residual, 1e-8)
 
         if n_reps > 1:
             vc_stack = jnp.stack([x[0] for x in reps], axis=0)
             vc_mean = jnp.mean(vc_stack, axis=0)
             vc_center = vc_stack - vc_mean
-            jackknife_se_var = jnp.sqrt(
-                jnp.maximum(0.0, jnp.sum(vc_center**2, axis=0) * (n_reps - 1) / n_reps)
+            monte_carlo_se_var = jnp.sqrt(
+                jnp.maximum(
+                    0.0,
+                    jnp.sum(vc_center**2, axis=0) / float(n_reps * (n_reps - 1)),
+                )
             )
+            jackknife_se_var = monte_carlo_se_var
             rep_var_components = vc_stack
-            h2_vals = 1.0 - vc_stack[:, -1] / jnp.maximum(jnp.sum(vc_stack, axis=1), 1e-8)
+            h2_vals = _trace_weighted_h2(vc_stack)
             h2_center = h2_vals - jnp.mean(h2_vals)
-            jackknife_se_h2 = float(
-                jnp.sqrt(jnp.maximum(0.0, jnp.sum(h2_center**2) * (n_reps - 1) / n_reps))
+            monte_carlo_se_h2 = float(
+                jnp.sqrt(
+                    jnp.maximum(
+                        0.0,
+                        jnp.sum(h2_center**2) / float(n_reps * (n_reps - 1)),
+                    )
+                )
             )
+            jackknife_se_h2 = monte_carlo_se_h2
+            # AI/gradient/loglik from one replicate do not describe vc_mean.
+            diagnostics = None
+
+        heritability = float(jax.device_get(_trace_weighted_h2(vc_mean)))
 
         effects = None
         if estimate_effects:
@@ -1698,6 +1955,11 @@ class InfinitesimalREMLFitter:
                 else float(jax.device_get(diagnostics.get("loglik")))
             ),
             diagnostics=diagnostics,
+            heritability=heritability,
+            genetic_trace_atoms=genetic_trace_atoms,
+            residual_trace_atoms=residual_trace_atoms,
+            monte_carlo_se_var=monte_carlo_se_var,
+            monte_carlo_se_h2=monte_carlo_se_h2,
         )
         if self.cfg.verbose:
             logger.info("fit_infinitesimal done @ %s elapsed=%.1fs",

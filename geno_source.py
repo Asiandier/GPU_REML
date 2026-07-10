@@ -16,6 +16,46 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _read_fam_iids(path: str) -> tuple[str, ...]:
+    iids: list[str] = []
+    with open(path) as handle:
+        for line_no, line in enumerate(handle, start=1):
+            cols = line.split()
+            if len(cols) < 2:
+                raise ValueError(f"{path}: line {line_no} has fewer than 2 columns.")
+            iids.append(cols[1])
+    return tuple(iids)
+
+
+def _read_psam_iids(path: str) -> tuple[str, ...]:
+    header: list[str] | None = None
+    iids: list[str] = []
+    with open(path) as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                candidate = stripped.lstrip("#").split()
+                if "IID" in candidate:
+                    header = candidate
+                continue
+            cols = stripped.split()
+            if header is None:
+                iid_idx = 1 if len(cols) >= 2 else 0
+            else:
+                try:
+                    iid_idx = header.index("IID")
+                except ValueError as exc:
+                    raise ValueError(f"{path}: PSAM header is missing IID.") from exc
+            if len(cols) <= iid_idx:
+                raise ValueError(f"{path}: sample row has no IID: {stripped!r}.")
+            iids.append(cols[iid_idx])
+    if not iids:
+        raise ValueError(f"{path}: no sample IDs found.")
+    return tuple(iids)
+
+
 @runtime_checkable
 class GenoBlockSource(Protocol):
     """Protocol for genotype block providers."""
@@ -63,15 +103,28 @@ class BedGenoSource:
         self._n_full: int = int(self._bed.iid_count)
         self.m: int = int(self._bed.sid_count)
         self._threads = max(1, int(threads or (os.cpu_count() or 1)))
+        sample_ids_full = _read_fam_iids(bed_prefix + ".fam")
+        if len(sample_ids_full) != self._n_full:
+            raise ValueError(
+                f"BED/FAM sample count mismatch for {bed_prefix!r}: "
+                f"BED has {self._n_full}, FAM has {len(sample_ids_full)}."
+            )
 
         # Push sample subsetting into bed_reader via integer indices.
         if sample_mask is not None:
             sample_mask = np.asarray(sample_mask, dtype=bool)
+            if sample_mask.shape != (self._n_full,):
+                raise ValueError(
+                    f"sample_mask length mismatch: expected {self._n_full}, "
+                    f"got {sample_mask.size}."
+                )
             self._sample_idx = np.where(sample_mask)[0]
             self.n: int = int(self._sample_idx.shape[0])
+            self.sample_ids = tuple(sample_ids_full[idx] for idx in self._sample_idx)
         else:
             self._sample_idx = None
             self.n: int = self._n_full
+            self.sample_ids = sample_ids_full
 
         # Detect missing-value encoding used by bed_reader
         self.missing_val: int = -127
@@ -135,17 +188,30 @@ class PgenGenoSource:
         )
         self._n_full: int = int(self._reader.get_raw_sample_ct())
         self.m: int = int(self._reader.get_variant_ct())
+        sample_ids_full = _read_psam_iids(pgen_prefix + ".psam")
+        if len(sample_ids_full) != self._n_full:
+            raise ValueError(
+                f"PGEN/PSAM sample count mismatch for {pgen_prefix!r}: "
+                f"PGEN has {self._n_full}, PSAM has {len(sample_ids_full)}."
+            )
 
         if sample_mask is not None:
             sample_mask = np.asarray(sample_mask, dtype=bool)
+            if sample_mask.shape != (self._n_full,):
+                raise ValueError(
+                    f"sample_mask length mismatch: expected {self._n_full}, "
+                    f"got {sample_mask.size}."
+                )
             self._sample_idx = np.where(sample_mask)[0].astype(np.uint32, copy=False)
             # Push sample subsetting into pgenlib so it decodes only
             # the kept samples instead of the full source sample set.
             self._reader.change_sample_subset(self._sample_idx)
             self.n: int = int(self._sample_idx.shape[0])
+            self.sample_ids = tuple(sample_ids_full[int(idx)] for idx in self._sample_idx)
         else:
             self._sample_idx = None
             self.n: int = self._n_full
+            self.sample_ids = sample_ids_full
 
         self._chunk_buf_i8: np.ndarray | None = None
         # Preserve pgenlib's native hardcall-missing sentinel so we do not

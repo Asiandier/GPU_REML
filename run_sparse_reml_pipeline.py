@@ -34,10 +34,15 @@ _runtime_mod.configure_runtime_env()
 import jax
 import jax.numpy as jnp
 import numpy as np
+import scipy.linalg as sla
 from bed_reader import open_bed
 
-# FP32 main path with TF32 matmul throughput on Ampere+ GPUs.
-jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+# Highest FP32 accumulation is the robust default; users can explicitly select
+# a faster hardware-specific mode after validating it on their GPU.
+jax.config.update(
+    "jax_default_matmul_precision",
+    os.environ.get("GPU_REML_MATMUL_PRECISION", "highest"),
+)
 logger = logging.getLogger(__name__)
 
 _inf_mod = importlib.import_module(f"{pkg_name}.reml_model")
@@ -68,6 +73,7 @@ read_keep_ids = _common_mod.read_keep_ids
 setup_gpu = _common_mod.setup_gpu
 run_planner = _common_mod.run_planner
 print_planner_info = _common_mod.print_planner_info
+log_runtime_gpu_memory = _common_mod.log_runtime_gpu_memory
 ensure_parent_dir = _io_utils_mod.ensure_parent_dir
 solve_spd = _common_mod.solve_spd
 cleanup_path = _common_mod.cleanup_path
@@ -95,6 +101,104 @@ def _load_component_variant_indices(path: str) -> list[np.ndarray]:
         np.asarray(spec.variant_indices, dtype=np.int64).reshape(-1)
         for spec in load_component_specs(path)
     ]
+
+
+def _normalized_design_is_well_conditioned(
+    design: np.ndarray,
+    *,
+    relative_tol: float,
+) -> bool:
+    """Match the normalized-Gram rank criterion used by REML."""
+    if design.shape[1] == 0:
+        return True
+    norms = np.linalg.norm(design, axis=0)
+    if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
+        return False
+    normalized = design / norms
+    gram = normalized.T @ normalized
+    eigvals = np.linalg.eigvalsh(0.5 * (gram + gram.T))
+    return bool(
+        eigvals[0]
+        > float(relative_tol) * max(float(eigvals[-1]), 1.0)
+    )
+
+
+def _merge_independent_fixed_effects(
+    covar: np.ndarray | None,
+    active_geno: np.ndarray,
+    *,
+    relative_tol: float = 1e-7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Append a numerically independent subset of active SNP fixed effects.
+
+    LASSO may select perfectly linked SNPs. Their fixed-effect columns span the
+    same space, but passing every duplicate to REML makes ``X'V^-1X`` singular.
+    Pivoted QR finds a stable spanning subset while always retaining the base
+    covariates. The returned indices refer to columns of ``active_geno``.
+    """
+    active = np.asarray(active_geno, dtype=np.float64)
+    if active.ndim != 2:
+        raise ValueError("active_geno must be a two-dimensional matrix.")
+    n_samples = int(active.shape[0])
+
+    if covar is None:
+        base = np.empty((n_samples, 0), dtype=np.float64)
+    else:
+        base = np.asarray(covar, dtype=np.float64)
+        if base.ndim != 2 or int(base.shape[0]) != n_samples:
+            raise ValueError("covar and active_geno must have matching rows.")
+    if not np.all(np.isfinite(base)) or not np.all(np.isfinite(active)):
+        raise ValueError("Fixed-effect columns must contain only finite values.")
+    if not _normalized_design_is_well_conditioned(
+        base, relative_tol=relative_tol
+    ):
+        raise ValueError(
+            "covar is rank-deficient or numerically collinear; "
+            "remove redundant fixed-effect columns."
+        )
+
+    active_norms = np.linalg.norm(active, axis=0)
+    eligible = np.flatnonzero(np.isfinite(active_norms) & (active_norms > 0.0))
+    if eligible.size == 0:
+        return np.asarray(base, dtype=np.float32), np.empty((0,), dtype=np.int64)
+
+    active_normalized = active[:, eligible] / active_norms[eligible]
+    if base.shape[1] > 0:
+        base_normalized = base / np.linalg.norm(base, axis=0)
+        q_base, _ = sla.qr(
+            base_normalized,
+            mode="economic",
+            check_finite=False,
+        )
+        active_residual = active_normalized - q_base @ (q_base.T @ active_normalized)
+    else:
+        active_residual = active_normalized
+
+    _, r_active, piv = sla.qr(
+        active_residual,
+        mode="economic",
+        pivoting=True,
+        check_finite=False,
+    )
+    diag = np.abs(np.diag(r_active))
+    if diag.size == 0:
+        selected_order = np.empty((0,), dtype=np.int64)
+    else:
+        qr_tol = np.sqrt(float(relative_tol)) * max(float(diag[0]), 1.0)
+        rank = int(np.count_nonzero(diag > qr_tol))
+        selected_order = eligible[np.asarray(piv[:rank], dtype=np.int64)]
+
+    while selected_order.size > 0:
+        trial = np.concatenate([base, active[:, selected_order]], axis=1)
+        if _normalized_design_is_well_conditioned(
+            trial, relative_tol=relative_tol
+        ):
+            break
+        selected_order = selected_order[:-1]
+
+    selected = np.sort(selected_order)
+    merged = np.concatenate([base, active[:, selected]], axis=1)
+    return np.asarray(merged, dtype=np.float32), selected
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +434,12 @@ def parse_args() -> argparse.Namespace:
         dest="gpu_budget_gib",
         type=float,
         default=float(env("GPU_BUDGET_GIB", env("GPU_BUDGET_GB", "0"))),
-        help="Manual GPU budget in GiB for planner (`--gpu-budget-gb` is a legacy alias; 0 = use 85%% of current free memory)",
+        help=(
+            "Planner budget for active GPU allocations in GiB "
+            "(`--gpu-budget-gb` is a legacy alias; 0 = use 85%% of current "
+            "free memory). JAX allocator reservation shown by nvidia-smi may "
+            "be higher."
+        ),
     )
     p.add_argument("--ring-depth", type=int, default=int(env("RING_DEPTH", "0")),
                    help="Pinned ring buffer depth (0 = auto, default 32)")
@@ -698,8 +807,9 @@ def main() -> None:
             else None
         ),
         arbitrary_component_partition=bool(component_variant_indices),
+        requested_call_width=(args.call_width if args.call_width > 0 else None),
     )
-    call_width = args.call_width or plan.call_width
+    call_width = plan.call_width
     gpu_budget_bytes = (
         float(args.gpu_budget_gib) * 1024**3
         if args.gpu_budget_gib > 0
@@ -790,9 +900,37 @@ def main() -> None:
 
     y_jax = jnp.asarray(y_np, dtype=jnp.float32)
     n_grm = len(ops.K_mvs)
-    # Match fit_reml default initialization: h2_init=0.5 split across GRMs.
+    genetic_trace_atoms = np.asarray(
+        jax.device_get(fitter._projected_core_diag_atoms(ops.diag_list)),
+        dtype=np.float64,
+    )
+    if (
+        genetic_trace_atoms.shape != (n_grm,)
+        or not np.all(np.isfinite(genetic_trace_atoms))
+        or not np.all(genetic_trace_atoms >= 0.0)
+    ):
+        raise RuntimeError("Invalid genetic trace atoms for sparse REML initialization.")
+
+    def _trace_weighted_h2(theta_values: np.ndarray) -> float:
+        theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
+        genetic_var = float(np.dot(theta_arr[:n_grm], genetic_trace_atoms))
+        residual_var = float(theta_arr[n_grm])
+        return genetic_var / max(genetic_var + residual_var, 1e-8)
+
+    def _trace_weighted_genetic_var(theta_values: np.ndarray) -> float:
+        theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
+        return float(np.dot(theta_arr[:n_grm], genetic_trace_atoms))
+
+    # Match fit_reml's trace-calibrated default initialization.
     h2_init_default = 0.5
-    theta_g0 = np.full((n_grm,), h2_init_default / max(n_grm, 1), dtype=np.float64)
+    trace_sum = float(np.sum(genetic_trace_atoms))
+    if trace_sum <= 0.0:
+        raise RuntimeError("Sparse REML requires at least one positive-trace GRM.")
+    theta_g0 = np.where(
+        genetic_trace_atoms > 0.0,
+        h2_init_default / trace_sum,
+        0.0,
+    )
     theta_e0 = np.array([1.0 - h2_init_default], dtype=np.float64)
     theta = np.concatenate([theta_g0, theta_e0], axis=0)
     fitter._ensure_projected_core_precond_ready(
@@ -1144,17 +1282,26 @@ def main() -> None:
 
         # ---- Step 5: REML re-fit with active SNPs as fixed effects ----
         X_fixed = covar_np
+        active_fixed_local = np.empty((0,), dtype=np.int64)
         if active_local.size > 0:
             Z_active = Z_cand[:, active_local]
-            if X_fixed is None:
-                X_fixed = Z_active
-            else:
-                X_fixed = np.concatenate([X_fixed, Z_active], axis=1)
+            X_fixed, active_fixed_local = _merge_independent_fixed_effects(
+                X_fixed,
+                Z_active,
+            )
+            if active_fixed_local.size != active_local.size:
+                logger.info(
+                    "[outer %s] REML fixed effects retained %s/%s active SNP "
+                    "columns after removing numerical dependencies.",
+                    outer,
+                    int(active_fixed_local.size),
+                    int(active_local.size),
+                )
 
         reml_res = fitter.fit_infinitesimal(
             y_jax,
             jnp.asarray(X_fixed, dtype=jnp.float32) if X_fixed is not None else None,
-            h2_init=float(np.sum(theta[:-1]) / max(np.sum(theta), 1e-8)),
+            h2_init=_trace_weighted_h2(theta),
             var_components_init=jnp.asarray(theta, dtype=jnp.float32),
         )
         if args.verbose:
@@ -1178,6 +1325,7 @@ def main() -> None:
             "pcg_all_res": float(np.asarray(res_all)),
             "theta": theta_new.tolist(),
             "support_size": int(support_new.size),
+            "active_fixed_effect_size": int(active_fixed_local.size),
             "support_same": support_same,
             "vc_rel": float(vc_rel),
             "lam": float(lasso["lam"]),
@@ -1214,7 +1362,7 @@ def main() -> None:
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    h2_reml = float(np.sum(theta[:-1]) / max(np.sum(theta), 1e-8))
+    h2_reml = _trace_weighted_h2(theta)
     h2_chive = h2_reml
     h2_chive_reml = h2_reml
     q_chive = 0.0
@@ -1244,7 +1392,7 @@ def main() -> None:
             y_chive,
             beta_lasso_active,
         )
-        theta_lasso_sum = float(np.sum(theta_lasso[:-1]))
+        theta_lasso_sum = _trace_weighted_genetic_var(theta_lasso)
         theta_lasso_e = float(theta_lasso[-1])
         h2_chive = float(
             (q_chive + theta_lasso_sum) /
@@ -1294,7 +1442,7 @@ def main() -> None:
             y_chive_reml,
             beta_gls_active,
         )
-        theta_sum = float(np.sum(theta[:-1]))
+        theta_sum = _trace_weighted_genetic_var(theta)
         theta_e_final = float(theta[-1])
         h2_chive_reml = float(
             (q_chive_reml + theta_sum) /
@@ -1316,6 +1464,7 @@ def main() -> None:
         "n_snps_total": grm_index.m_total,
         "n_grms": grm_index.n_grm,
         "m_per_grm": grm_index.m_per_grm.tolist(),
+        "genetic_trace_atoms": genetic_trace_atoms.tolist(),
         "component_spec": component_spec_source or None,
         "component_partition_mode": (
             "snp_id" if component_variant_indices else "input_prefix"
@@ -1404,6 +1553,7 @@ def main() -> None:
     logger.info("[INFO] done @ %s elapsed=%.1fs", datetime.now().isoformat(timespec='seconds'), time.time() - t0)
     logger.info("[INFO] summary -> %s.summary.json", out_prefix)
     logger.info("[INFO] support -> %s.selected_snps.tsv", out_prefix)
+    log_runtime_gpu_memory(plan)
     close_fitter()
     atexit.unregister(close_fitter)
 

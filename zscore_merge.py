@@ -54,11 +54,38 @@ def specs_to_components(spec_path: str) -> list[dict[str, object]]:
     return components
 
 
-def h2_from_theta(theta: np.ndarray) -> float:
-    genetic = float(theta[:-1].sum())
-    residual = float(theta[-1])
+def h2_from_theta(
+    theta: np.ndarray,
+    genetic_trace_atoms: np.ndarray | None = None,
+    residual_trace_atoms: np.ndarray | None = None,
+) -> float:
+    theta = np.asarray(theta, dtype=np.float64).reshape(-1)
+    if genetic_trace_atoms is None:
+        genetic = float(theta[:-1].sum())
+        residual = float(theta[-1])
+    else:
+        genetic_atoms = np.asarray(genetic_trace_atoms, dtype=np.float64).reshape(-1)
+        residual_atoms = np.asarray(
+            [1.0] if residual_trace_atoms is None else residual_trace_atoms,
+            dtype=np.float64,
+        ).reshape(-1)
+        if theta.size != genetic_atoms.size + residual_atoms.size:
+            raise ValueError("Trace-atom lengths do not match theta.")
+        genetic = float(np.dot(theta[: genetic_atoms.size], genetic_atoms))
+        residual = float(np.dot(theta[genetic_atoms.size :], residual_atoms))
     denom = genetic + residual
     return genetic / denom if denom > 0.0 else float("nan")
+
+
+def _h2_from_round(theta: np.ndarray, prefix: Path) -> float:
+    meta_path = prefix.with_suffix(".ai_stats.json")
+    if not meta_path.exists():
+        return h2_from_theta(theta)
+    meta = json.loads(meta_path.read_text())
+    genetic_atoms = meta.get("genetic_trace_atoms")
+    if genetic_atoms is None:
+        return h2_from_theta(theta)
+    return h2_from_theta(theta, genetic_atoms, meta.get("residual_trace_atoms"))
 
 
 def zscore_components(
@@ -260,8 +287,8 @@ def _pipeline_command(args: argparse.Namespace, component_spec: Path, out_prefix
     _add_arg(cmd, "--precond-refresh-reldp", args.precond_refresh_reldp)
     _add_arg(cmd, "--precond-type", args.precond_type)
     _add_arg(cmd, "--minq-iter", args.minq_iter)
-    if args.verbose:
-        cmd.append("--verbose")
+    if not args.verbose:
+        cmd.append("--non-verbose")
     return cmd
 
 
@@ -321,6 +348,11 @@ def _validate_merge_args(args: argparse.Namespace) -> Path:
         raise SystemExit("--merge is separate from SMILE mode and cannot be combined with SMILE W inputs.")
     if args.rare_bed_prefix or args.rare_pgen_prefix:
         raise SystemExit("--merge currently supports dense single-source component-spec fits only.")
+    if any(
+        getattr(args, name, "")
+        for name in ("admix_q", "admix_fam", "admix_component_names")
+    ):
+        raise SystemExit("--merge cannot be combined with ADMIXTURE covariance inputs.")
     if args.vc_block_sizes or args.component_indices_npz:
         raise SystemExit("--merge requires --component-spec; do not use --vc-block-sizes or --component-indices-npz.")
     if not args.component_spec:
@@ -383,7 +415,7 @@ def run_from_pipeline_args(args: argparse.Namespace) -> dict[str, object]:
             "stage": "fine_model_zscore_merge",
             "merge_mode": args.merge_mode,
             "n_components": len(components),
-            "h2": h2_from_theta(fine_theta),
+            "h2": _h2_from_round(fine_theta, round00_prefix),
             "sum_theta_g": float(fine_theta[:-1].sum()),
             "theta_e": float(fine_theta[-1]),
             "n_weak_z": n_weak,
@@ -421,7 +453,7 @@ def run_from_pipeline_args(args: argparse.Namespace) -> dict[str, object]:
                 "stage": "merged_refit",
                 "merge_mode": args.merge_mode,
                 "n_components": len(next_components),
-                "h2": h2_from_theta(merged_theta),
+                "h2": _h2_from_round(merged_theta, round01_prefix),
                 "sum_theta_g": float(merged_theta[:-1].sum()),
                 "theta_e": float(merged_theta[-1]),
                 "next_n_components": len(next_components),
@@ -450,7 +482,7 @@ def run_from_pipeline_args(args: argparse.Namespace) -> dict[str, object]:
         "merged_component_spec": merged_component_spec,
         "final_component_spec": str(final_spec),
         "final_theta_npy": str(final_prefix.with_suffix(".theta.npy")),
-        "final_h2": h2_from_theta(final_theta),
+        "final_h2": _h2_from_round(final_theta, final_prefix),
         "n_initial_components": len(components),
         "n_final_components": len(final_components),
         "n_weak_z_at_merge": int(n_weak),

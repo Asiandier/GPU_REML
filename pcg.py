@@ -13,6 +13,7 @@ Performance notes
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Callable, Optional, Tuple
 
 import jax
@@ -25,7 +26,7 @@ def _identity(v: Array) -> Array:
     return v
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(4,))
 def _pcg_state_update(
     X: Array,
     R: Array,
@@ -91,6 +92,7 @@ def pcg_solve(
     Z     = M(R)
     P     = Z
     rs    = jnp.sum(R * Z, axis=0)
+    del Z
     rnorm = jnp.linalg.norm(R, axis=0)
 
     # Check once up front — warm-started X0 may already be converged.
@@ -101,8 +103,10 @@ def pcg_solve(
     while k < maxiter:
         AP   = Hv(P)                                      # ← dominant cost
         X, R = _pcg_state_update(X, R, P, rs, AP)
+        del AP
         Z    = M(R)
         P, rs, rnorm = _pcg_direction_update(P, R, Z, rs)
+        del Z
         k += 1
 
         # Periodic convergence check (GPU→CPU sync).

@@ -91,6 +91,7 @@ def run_smile_planner(
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
     smile_w_block_sizes: Optional[Sequence[int]] = None,
+    requested_call_width: Optional[int] = None,
 ):
     """Run the base planner after reserving SMILE-specific GPU workspace."""
 
@@ -146,6 +147,7 @@ def run_smile_planner(
         ring_depth=ring_depth,
         source_format=source_format,
         arbitrary_component_partition=arbitrary_component_partition,
+        requested_call_width=requested_call_width,
     )
     plan.note += (
         f" smile_extra_reserved={reserve / _GIB:.2f}GiB"

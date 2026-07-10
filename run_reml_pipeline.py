@@ -25,7 +25,10 @@ import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
 
-jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+jax.config.update(
+    "jax_default_matmul_precision",
+    os.environ.get("GPU_REML_MATMUL_PRECISION", "highest"),
+)
 
 _inf_mod = importlib.import_module(f"{pkg_name}.reml_model")
 _data_mod = importlib.import_module(f"{pkg_name}.data_utils")
@@ -55,6 +58,7 @@ read_keep_ids = _common_mod.read_keep_ids
 setup_gpu = _common_mod.setup_gpu
 run_planner = _common_mod.run_planner
 print_planner_info = _common_mod.print_planner_info
+log_runtime_gpu_memory = _common_mod.log_runtime_gpu_memory
 cleanup_path = _common_mod.cleanup_path
 make_nonbed_input_fam = _common_mod.make_nonbed_input_fam
 compute_sample_mask = _common_mod.compute_sample_mask
@@ -126,9 +130,9 @@ def _parse_component_names(raw: str) -> list[str] | None:
     return names or None
 
 
-def _admixed_component_h2(tau2: float, sigma2: float) -> float:
-    denom = float(tau2) + float(sigma2)
-    return float(tau2) / denom if denom > 0 else float("nan")
+def _variance_contribution_ratio(genetic: float, residual: float) -> float:
+    denom = float(genetic) + float(residual)
+    return float(genetic) / denom if denom > 0 else float("nan")
 
 
 def _parse_bool_env_default_true(name: str) -> bool:
@@ -309,7 +313,12 @@ def parse_args():
         dest="gpu_budget_gib",
         type=float,
         default=float(env("GPU_BUDGET_GIB", env("GPU_BUDGET_GB", "0"))),
-        help="GPU budget in GiB (`--gpu-budget-gb` is a legacy alias; 0 = use 85%% of current free)",
+        help=(
+            "Planner budget for active GPU allocations in GiB "
+            "(`--gpu-budget-gb` is a legacy alias; 0 = use 85%% of current "
+            "free memory). JAX allocator reservation shown by nvidia-smi may "
+            "be higher."
+        ),
     )
     p.add_argument("--ring-depth", type=int, default=int(env("RING_DEPTH", "0")),
                    help="Pinned ring buffer depth (0 = auto, default 32)")
@@ -343,13 +352,20 @@ def parse_args():
         default=env("EXPORT_AI", "").strip().lower() in {"1", "true", "yes", "on"},
         help="Write final variance components, Average Information matrix, gradient and fit metadata to <out-prefix>.*.",
     )
-    p.add_argument(
+    verbosity = p.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "--verbose",
+        action="store_true",
+        dest="verbose",
+        help="Enable detailed REML logging (the default unless VERBOSE disables it).",
+    )
+    verbosity.add_argument(
         "--non-verbose",
         action="store_false",
         dest="verbose",
-        default=_parse_bool_env_default_true("VERBOSE"),
         help="Disable detailed REML logging.",
     )
+    p.set_defaults(verbose=_parse_bool_env_default_true("VERBOSE"))
     return p.parse_args()
 
 
@@ -452,6 +468,8 @@ def main():
         raise SystemExit("Admixed covariance mode requires exactly one dense genotype input.")
     if use_admixed and (args.compute_effects or prediction_active):
         raise SystemExit("Admixed covariance mode currently supports variance-component estimation only.")
+    if prediction_active and (rare_bed_list or rare_pgen_prefix):
+        raise SystemExit("Prediction currently supports dense genotype paths only; remove rare inputs.")
     if vc_block_sizes or component_variant_indices:
         if _n_dense != 1:
             raise SystemExit("single-source component partitioning requires exactly one dense input.")
@@ -609,6 +627,7 @@ def main():
             else None
         ),
         arbitrary_component_partition=bool(component_variant_indices),
+        requested_call_width=(args.call_width if args.call_width > 0 else None),
     )
     if use_smile:
         plan = run_smile_planner(
@@ -621,7 +640,7 @@ def main():
         plan.source_build_chunk_width if plan.source_build_chunk_width > 0 else None
     )
 
-    call_width = args.call_width or plan.call_width
+    call_width = plan.call_width
     gpu_budget_bytes = (
         float(args.gpu_budget_gib) * 1024**3
         if args.gpu_budget_gib > 0
@@ -751,6 +770,12 @@ def main():
             n_admix = int(admix_weights.shape[1])
             names = tuple(admix_component_names or [f"admix_{idx:03d}" for idx in range(n_admix)])
             tau2 = vc[:n_admix]
+            genetic_atoms = np.asarray(
+                jax.device_get(res.genetic_trace_atoms), dtype=np.float64,
+            )
+            residual_atoms = np.asarray(
+                jax.device_get(res.residual_trace_atoms), dtype=np.float64,
+            )
             print("admixed_h2_by_component:")
             if args.admix_residual_mode == "per-ancestry":
                 sigma2 = vc[n_admix : 2 * n_admix]
@@ -760,39 +785,47 @@ def main():
                     )
                 weighted_tau = admix_weights.astype(np.float64, copy=False) @ tau2
                 weighted_sigma = admix_weights.astype(np.float64, copy=False) @ sigma2
-                denom = weighted_tau + weighted_sigma
+                base_diag = np.asarray(
+                    jax.device_get(model.streamers[0].exact_diag()),
+                    dtype=np.float64,
+                )
+                weighted_genetic = base_diag * weighted_tau
+                denom = weighted_genetic + weighted_sigma
                 weighted_h2 = np.divide(
-                    weighted_tau,
+                    weighted_genetic,
                     denom,
                     out=np.full_like(weighted_tau, np.nan, dtype=np.float64),
                     where=denom > 0,
                 )
-                avg_tau = float(np.mean(weighted_tau))
+                avg_genetic = float(np.mean(weighted_genetic))
                 avg_sigma = float(np.mean(weighted_sigma))
-                avg_denom = avg_tau + avg_sigma
-                if avg_denom > 0:
-                    print(f"h2_weighted_mean: {avg_tau / avg_denom:.6f}")
-                print(f"weighted_tau_mean: {avg_tau:.6g}")
+                if res.heritability is not None:
+                    print(f"h2_weighted_mean: {res.heritability:.6f}")
+                print(f"weighted_genetic_mean: {avg_genetic:.6g}")
                 print(f"weighted_sigma_mean: {avg_sigma:.6g}")
                 print(f"weighted_h2_mean: {float(np.nanmean(weighted_h2)):.6f}")
-                for name, tau_val, sigma_val in zip(names, tau2, sigma2):
-                    h2_a = _admixed_component_h2(float(tau_val), float(sigma_val))
+                for idx, (name, tau_val, sigma_val) in enumerate(zip(names, tau2, sigma2)):
+                    h2_a = _variance_contribution_ratio(
+                        float(tau_val) * float(genetic_atoms[idx]),
+                        float(sigma_val) * float(residual_atoms[idx]),
+                    )
                     print(
                         f"  {name}: tau2={float(tau_val):.6g} "
                         f"sigma2={float(sigma_val):.6g} h2_a={h2_a:.6g}"
                     )
             else:
-                total = float(np.sum(vc))
-                if total > 0:
-                    print(f"h2: {float(np.sum(vc[:-1]) / total):.6f}")
+                if res.heritability is not None:
+                    print(f"h2: {res.heritability:.6f}")
                 sigma2 = float(vc[-1])
-                for name, tau_val in zip(names, tau2):
-                    h2_a = _admixed_component_h2(float(tau_val), sigma2)
+                for idx, (name, tau_val) in enumerate(zip(names, tau2)):
+                    h2_a = _variance_contribution_ratio(
+                        float(tau_val) * float(genetic_atoms[idx]),
+                        sigma2 * float(residual_atoms[0]),
+                    )
                     print(f"  {name}: tau2={float(tau_val):.6g} sigma2={sigma2:.6g} h2_a={h2_a:.6g}")
         else:
-            total = float(np.sum(vc))
-            if total > 0:
-                print(f"h2: {float(np.sum(vc[:-1]) / total):.6f}")
+            if res.heritability is not None:
+                print(f"h2: {res.heritability:.6f}")
     if res.history:
         for it in res.history:
             pcg = it.get("pcg_iters", 0)
@@ -827,6 +860,17 @@ def main():
                         else 1
                     ),
                     "admix_residual_mode": args.admix_residual_mode if admix_weights is not None else None,
+                    "heritability": res.heritability,
+                    "genetic_trace_atoms": (
+                        None
+                        if res.genetic_trace_atoms is None
+                        else np.asarray(jax.device_get(res.genetic_trace_atoms), dtype=np.float64).tolist()
+                    ),
+                    "residual_trace_atoms": (
+                        None
+                        if res.residual_trace_atoms is None
+                        else np.asarray(jax.device_get(res.residual_trace_atoms), dtype=np.float64).tolist()
+                    ),
                     "loglik": None if res.final_loglik is None else float(res.final_loglik),
                     "theta_npy": theta_path,
                     "ai_npy": ai_path,
@@ -994,6 +1038,7 @@ def main():
         for key, path in pred_paths.items():
             logger.info("  %s -> %s", key, path)
 
+    log_runtime_gpu_memory(plan)
     close_model()
     atexit.unregister(close_model)
 

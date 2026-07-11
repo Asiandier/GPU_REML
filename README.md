@@ -375,9 +375,7 @@ For routine runs, the most important user-facing resource controls are the GPU
 budget and the genotype-streaming ring depth.
 
 See [the mathematical overview](docs/mathematical_overview.md) for the score,
-AI, trace, SLQ, preconditioner, and heritability formulas, and
-[the architecture guide](docs/architecture.md) for module boundaries and the
-fit lifecycle.
+AI, trace, SLQ, preconditioner, and heritability formulas.
 
 ## Key Runtime Parameters
 
